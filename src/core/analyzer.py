@@ -883,13 +883,130 @@ class BrainAnalyzer:
     def run_full_pipeline(self, options: dict) -> dict:
         results: dict = {}
         try:
+            # ── 管线配置快照 ────────────────────────────────────────────────
+            from core.advanced_preprocessing import PipelineConfig
+            cfg = PipelineConfig(self.output_dir, overrides={
+                "nuisance_regression": {
+                    "motion_params": 24 if options.get("motion_24") else 6,
+                    "wm_regression": options.get("wm_csf", True),
+                    "csf_regression": options.get("wm_csf", True),
+                    "gsr": options.get("gsr", False),
+                },
+                "roi_system": {
+                    "atlas": "schaefer_2018" if options.get("schaefer") else "mni_33roi",
+                    "n_parcels": options.get("schaefer_n", 100),
+                },
+            })
+            cfg.save_yaml()
+
             nifti, sidecar = self.convert_dicom_to_nifti()
             results.update({"nifti_file": nifti, "scan_params": self.scan_params,
                              "sidecar": sidecar})
+
+            # ── 基础预处理 ─────────────────────────────────────────────────
             pre  = self.preprocess(nifti)
             results["preprocessed"] = pre
+
+            # ── 运动估计（相位相关法）────────────────────────────────────────
+            motion_params = None
+            fd_mm = None
+            if options.get("motion_correction", True):
+                try:
+                    self.progress_cb(35, "运动估计（相位相关法）...")
+                    from core.advanced_preprocessing import MotionEstimator
+                    img  = __import__("nibabel").load(nifti)
+                    data = img.get_fdata(dtype=__import__("numpy").float32)
+                    me   = MotionEstimator(data, self.TR, self.results_dir,
+                                           progress_cb=self.progress_cb)
+                    motion_params = me.estimate_translations()
+                    fd_mm = __import__("numpy").load(
+                        __import__("os").path.join(self.results_dir, "fd_mm.npy"))
+                    results["motion_params"] = motion_params.tolist()
+                    results["fd_mm"] = fd_mm.tolist()
+                except Exception as e:
+                    self.progress_cb(35, f"运动估计跳过: {e}")
+
+            # ── Nuisance Regression ─────────────────────────────────────────
+            if options.get("nuisance_regression", True):
+                try:
+                    self.progress_cb(37, "Nuisance regression...")
+                    import numpy as np
+                    from core.advanced_preprocessing import NuisanceRegressor
+                    ts_raw = np.load(__import__("os").path.join(
+                        self.results_dir, "ts_raw_brain.npy"))
+                    mask   = np.load(__import__("os").path.join(
+                        self.results_dir, "brain_mask.npy"))
+                    nr = NuisanceRegressor(ts_raw, mask, self.results_dir)
+
+                    # WM/CSF 信号提取（从 4D 平滑数据）
+                    data_smooth = np.load(__import__("os").path.join(
+                        self.results_dir, "data_preprocessed.npy"))
+                    wm_csf = None
+                    if options.get("wm_csf", True):
+                        wm_csf = nr.extract_wm_csf_signals(data_smooth)
+
+                    ts_clean = nr.regress(
+                        motion_params=motion_params,
+                        wm_csf_signals=wm_csf,
+                        include_gsr=options.get("gsr", False),
+                        n_motion_params=24 if options.get("motion_24") else 6,
+                    )
+                    results["nuisance_cleaned"] = True
+                except Exception as e:
+                    self.progress_cb(37, f"Nuisance regression 跳过: {e}")
+                    results["nuisance_cleaned"] = False
+
+            # ── QC ─────────────────────────────────────────────────────────
             qc   = self.quality_control(pre)
             results["qc_metrics"] = qc
+
+            # ── Carpet Plot + Scrubbing ──────────────────────────────────────
+            if options.get("carpet_plot", True):
+                try:
+                    self.progress_cb(46, "Carpet plot + scrubbing 建议...")
+                    import numpy as np
+                    from core.advanced_preprocessing import CarpetPlotQC
+                    img_4d = __import__("nibabel").load(pre)
+                    data_4d= img_4d.get_fdata(dtype=np.float32)
+                    mask   = np.load(__import__("os").path.join(
+                        self.results_dir, "brain_mask.npy"))
+                    FD_arr = np.load(__import__("os").path.join(
+                        self.results_dir, "FD_proxy.npy"))
+                    DVARS  = np.load(__import__("os").path.join(
+                        self.results_dir, "DVARS.npy"))
+                    cpqc   = CarpetPlotQC(data_4d, mask, FD_arr, DVARS,
+                                           self.TR, self.results_dir)
+                    scrub  = cpqc.recommend_scrubbing()
+                    carpet = cpqc.generate_carpet_plot()
+                    results["scrubbing"]   = scrub
+                    results["carpet_plot"] = carpet
+                    self.progress_cb(47, f"Scrubbing建议: 去除{scrub['n_scrubbed']}帧"
+                                        f" → 剩余{scrub['n_remaining']}帧")
+                except Exception as e:
+                    self.progress_cb(46, f"Carpet plot 跳过: {e}")
+
+            # ── FC (Schaefer 或 MNI-33 ROI) ────────────────────────────────
+            if options.get("schaefer", False):
+                try:
+                    self.progress_cb(50, f"Schaefer-{options.get('schaefer_n',100)} FC...")
+                    from core.advanced_preprocessing import AtlasROIExtractor
+                    ext = AtlasROIExtractor(
+                        n_rois=options.get("schaefer_n", 100),
+                        output_dir=self.results_dir)
+                    ts_s, lbl_s, net_s = ext.extract_timeseries(pre)
+                    if ts_s is not None:
+                        FC_s = ext.compute_fc_matrix(ts_s)
+                        ns_s = ext.network_stats(FC_s, net_s)
+                        results["fc_schaefer"] = {
+                            "n_rois":        options.get("schaefer_n", 100),
+                            "network_stats": ns_s,
+                            "matrix_file":   f"schaefer{options.get('schaefer_n',100)}_FC_pearson.npy",
+                        }
+                        self.progress_cb(55, f"Schaefer FC 完成 {FC_s.shape[0]}×{FC_s.shape[0]}")
+                except Exception as e:
+                    self.progress_cb(50, f"Schaefer FC 跳过: {e}")
+
+            # 始终运行 MNI-33 ROI FC（作为基础结果）
             fc   = self.compute_functional_connectivity(pre)
             results["fc"] = fc
             if options.get("alff", True):
@@ -938,6 +1055,29 @@ class BrainAnalyzer:
                     if options.get("bilingual"):
                         reports["word_en"] = rg.generate_word_report("en")
                 results["reports"] = reports
+
+            # ── 可重复性哈希 + 管线快照 ──────────────────────────────────────
+            self.progress_cb(99, "生成可重复性哈希...")
+            try:
+                from core.advanced_preprocessing import PipelineConfig
+                cfg2 = PipelineConfig(self.output_dir)
+                snap = cfg2.snapshot(additional_info={
+                    "subject_id": self.scan_params.get("subject_id","unknown"),
+                    "bold_shape":  str(results.get("sidecar",{}).get("RepetitionTime","?")),
+                    "n_sequences": len(self.sequences),
+                })
+                hashes = cfg2.compute_reproducibility_hash(
+                    nifti_path=results.get("nifti_file"),
+                    results_dir=self.results_dir)
+                results["reproducibility"] = {
+                    "config_hash":    hashes.get("config_hash",""),
+                    "results_hash":   hashes.get("results_hash",""),
+                    "pipeline_snap":  snap,
+                }
+            except Exception as e:
+                print(f"可重复性哈希跳过: {e}")
+                results["reproducibility"] = {}
+
             self.progress_cb(100, "✓ 全部分析完成！")
         except Exception as e:
             import traceback

@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QProgressBar,
     QFileDialog, QGroupBox, QCheckBox, QSplitter,
     QStatusBar, QAction, QMenuBar, QMessageBox,
-    QTabWidget, QDialog)
+    QTabWidget, QDialog, QComboBox, QScrollArea)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
@@ -71,27 +71,17 @@ class MainWindow(QMainWindow):
 
         central = QWidget(); self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # 顶部：开发者信息
-        header = QWidget(); hlay = QHBoxLayout(header)
-        hlay.setContentsMargins(10, 4, 10, 4)
-        dev = QLabel(
-            '由 <a href="https://karcen.github.io/zhengjiacheng.github.io/" '
-            'style="color:#0078d4;text-decoration:none;">Karcen Zheng</a>'
-            ' 使用 Claude Code 辅助开发')
-        dev.setOpenExternalLinks(True)
-        dev.setStyleSheet("font-size:11px; color:#666;")
-        dev.setAlignment(Qt.AlignRight)
-        hlay.addStretch(); hlay.addWidget(dev)
-        root.addWidget(header)
-
-        # 主内容：左控制面板 + 右日志/结果
+        # 主内容：左控制面板 + 右日志/结果  (splitter 填满窗口)
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left())
         splitter.addWidget(self._build_right())
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        root.addWidget(splitter)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([340, 940])
+        root.addWidget(splitter, 1)   # stretch=1 → 填满全部可用高度
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -118,64 +108,140 @@ class MainWindow(QMainWindow):
         aa = QAction('关于', self); aa.triggered.connect(self._about); hm.addAction(aa)
 
     def _build_left(self) -> QWidget:
-        w = QWidget(); lay = QVBoxLayout(w)
+        """
+        三段式左侧面板：
+          ① 顶部（固定）— DICOM 输入 + 输出路径
+          ② 中部（可滚动）— 所有分析选项
+          ③ 底部（固定）— 开始/停止按钮 + 进度条 + 开发者信息
+        """
+        w = QWidget()
+        w.setMinimumWidth(300)
+        w.setMaximumWidth(400)
+        root = QVBoxLayout(w)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
 
-        # 输入
-        ig = QGroupBox("输入"); il = QVBoxLayout()
+        # ══ ① 顶部：输入区（固定，始终可见）════════════════════════════════
+        ig = QGroupBox("📂 输入")
+        il = QVBoxLayout(ig); il.setSpacing(4)
         self.lbl_dicom = QLabel("未选择 DICOM 文件夹")
-        self.lbl_dicom.setWordWrap(True); il.addWidget(self.lbl_dicom)
-        b1 = QPushButton("选择 DICOM 文件夹"); b1.clicked.connect(self._select_dicom)
+        self.lbl_dicom.setWordWrap(True)
+        self.lbl_dicom.setStyleSheet("color:#888; font-size:11px;")
+        il.addWidget(self.lbl_dicom)
+        b1 = QPushButton("选择 DICOM 文件夹 (Ctrl+O)")
+        b1.clicked.connect(self._select_dicom)
         il.addWidget(b1)
-        self.lbl_out = QLabel("输出: 自动创建在 DICOM 同级目录")
-        self.lbl_out.setWordWrap(True); il.addWidget(self.lbl_out)
-        b2 = QPushButton("自定义输出目录"); b2.clicked.connect(self._select_output)
-        il.addWidget(b2); ig.setLayout(il); lay.addWidget(ig)
+        self.lbl_out = QLabel("输出: 自动创建于 DICOM 同级目录")
+        self.lbl_out.setWordWrap(True)
+        self.lbl_out.setStyleSheet("color:#888; font-size:11px;")
+        il.addWidget(self.lbl_out)
+        b2 = QPushButton("自定义输出目录")
+        b2.clicked.connect(self._select_output)
+        il.addWidget(b2)
+        root.addWidget(ig)
 
-        # 分析选项
-        ag = QGroupBox("fMRI 分析选项"); al = QVBoxLayout()
-        self.chk_alff    = QCheckBox("ALFF / fALFF");        self.chk_alff.setChecked(True)
-        self.chk_reho    = QCheckBox("ReHo（较慢，~3分钟）"); self.chk_reho.setChecked(True)
-        self.chk_graph   = QCheckBox("图论分析");             self.chk_graph.setChecked(True)
-        self.chk_dynamic = QCheckBox("动态功能连接");         self.chk_dynamic.setChecked(True)
+        # ══ ② 中部：选项区（QScrollArea，可折叠滚动）════════════════════════
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(scroll.NoFrame)
+        opts = QWidget()
+        ol = QVBoxLayout(opts); ol.setSpacing(4); ol.setContentsMargins(0,0,2,0)
+
+        # fMRI 分析
+        ag = QGroupBox("fMRI 分析选项")
+        al = QVBoxLayout(ag); al.setSpacing(2)
+        self.chk_alff    = QCheckBox("ALFF / fALFF");       self.chk_alff.setChecked(True)
+        self.chk_reho    = QCheckBox("ReHo（~3 分钟）");    self.chk_reho.setChecked(True)
+        self.chk_graph   = QCheckBox("图论分析");            self.chk_graph.setChecked(True)
+        self.chk_dynamic = QCheckBox("动态功能连接");        self.chk_dynamic.setChecked(True)
         for c in [self.chk_alff, self.chk_reho, self.chk_graph, self.chk_dynamic]:
             al.addWidget(c)
-        ag.setLayout(al); lay.addWidget(ag)
+        ol.addWidget(ag)
 
-        # 多模态选项
-        mg = QGroupBox("多模态分析（自动识别可用序列）"); ml = QVBoxLayout()
-        self.chk_t1  = QCheckBox("T1 结构像（体积/组织分割）"); self.chk_t1.setChecked(True)
-        self.chk_dti = QCheckBox("DTI 弥散张量（FA/MD/WM束）"); self.chk_dti.setChecked(True)
-        self.chk_qsm = QCheckBox("QSM 铁沉积分析");             self.chk_qsm.setChecked(True)
-        hint = QLabel("☝ 未检测到对应序列时自动跳过")
-        hint.setStyleSheet("color: #888; font-size: 11px;")
-        for c in [self.chk_t1, self.chk_dti, self.chk_qsm, hint]:
+        # 高级预处理
+        adv_g = QGroupBox("高级预处理 (Scientific Grade)")
+        adv_l = QVBoxLayout(adv_g); adv_l.setSpacing(2)
+        self.chk_motion   = QCheckBox("运动估计（相位相关 → 真实 FD）")
+        self.chk_motion.setChecked(True)
+        self.chk_nuisance = QCheckBox("Nuisance Regression")
+        self.chk_nuisance.setChecked(True)
+        self.chk_motion24 = QCheckBox("  └ 24 参数运动模型（默认 6）")
+        self.chk_wm_csf   = QCheckBox("  └ WM / CSF 回归")
+        self.chk_wm_csf.setChecked(True)
+        self.chk_gsr      = QCheckBox("  └ 全局信号回归 GSR（默认关闭）")
+        self.chk_carpet   = QCheckBox("Carpet Plot + Scrubbing 建议")
+        self.chk_carpet.setChecked(True)
+        self.chk_schaefer = QCheckBox("Schaefer-2018 Atlas FC（需联网）")
+        self.cmb_schaefer = QComboBox()
+        self.cmb_schaefer.addItems(["100 parcels", "200 parcels", "400 parcels"])
+        self.cmb_schaefer.setEnabled(False)
+        self.chk_schaefer.stateChanged.connect(
+            lambda s: self.cmb_schaefer.setEnabled(s == Qt.Checked))
+        self.lbl_adv_hint = QLabel("☝ 运动估计 +10s；Schaefer 需首次联网")
+        self.lbl_adv_hint.setStyleSheet("color:#888; font-size:10px;")
+        for w2 in [self.chk_motion, self.chk_nuisance, self.chk_motion24,
+                   self.chk_wm_csf, self.chk_gsr, self.chk_carpet,
+                   self.chk_schaefer, self.cmb_schaefer, self.lbl_adv_hint]:
+            adv_l.addWidget(w2)
+        ol.addWidget(adv_g)
+
+        # 多模态
+        mg = QGroupBox("多模态分析（自动识别序列）")
+        ml = QVBoxLayout(mg); ml.setSpacing(2)
+        self.chk_t1  = QCheckBox("T1 结构像（体积 / 分割）"); self.chk_t1.setChecked(True)
+        self.chk_dti = QCheckBox("DTI（FA / MD / WM 束）");   self.chk_dti.setChecked(True)
+        self.chk_qsm = QCheckBox("QSM 铁沉积分析");           self.chk_qsm.setChecked(True)
+        self.lbl_mm_hint = QLabel("☝ 无对应序列时自动跳过")
+        self.lbl_mm_hint.setStyleSheet("color:#888; font-size:10px;")
+        for c in [self.chk_t1, self.chk_dti, self.chk_qsm, self.lbl_mm_hint]:
             ml.addWidget(c)
-        mg.setLayout(ml); lay.addWidget(mg)
+        ol.addWidget(mg)
 
         # 报告
-        rg = QGroupBox("报告生成"); rl = QVBoxLayout()
-        self.chk_pdf      = QCheckBox("生成 PDF 报告");   self.chk_pdf.setChecked(True)
-        self.chk_word     = QCheckBox("生成 Word 报告");  self.chk_word.setChecked(True)
-        self.chk_bilingual= QCheckBox("中英双语报告")
-        for c in [self.chk_pdf, self.chk_word, self.chk_bilingual]: rl.addWidget(c)
-        rg.setLayout(rl); lay.addWidget(rg)
+        rg = QGroupBox("报告生成")
+        rl = QVBoxLayout(rg); rl.setSpacing(2)
+        self.chk_pdf       = QCheckBox("PDF 报告");  self.chk_pdf.setChecked(True)
+        self.chk_word      = QCheckBox("Word 报告"); self.chk_word.setChecked(True)
+        self.chk_bilingual = QCheckBox("中英双语")
+        for c in [self.chk_pdf, self.chk_word, self.chk_bilingual]:
+            rl.addWidget(c)
+        ol.addWidget(rg)
+        ol.addStretch()
 
-        # 按钮 + 进度
-        self.btn_start = QPushButton("▶ 开始分析")
-        self.btn_start.setMinimumHeight(52)
-        font = QFont(); font.setPointSize(13); font.setBold(True)
-        self.btn_start.setFont(font)
+        scroll.setWidget(opts)
+        root.addWidget(scroll, 1)   # stretch=1 → 占据中部剩余空间
+
+        # ══ ③ 底部：按钮 + 进度条 + 署名（固定，始终可见）══════════════════
+        self.btn_start = QPushButton("▶  开 始 分 析")
+        self.btn_start.setObjectName("startBtn")
+        self.btn_start.setMinimumHeight(46)
+        f = QFont(); f.setPointSize(12); f.setBold(True)
+        self.btn_start.setFont(f)
         self.btn_start.clicked.connect(self._start)
-        lay.addWidget(self.btn_start)
+        root.addWidget(self.btn_start)
 
-        self.btn_stop = QPushButton("■ 停止")
+        self.btn_stop = QPushButton("■  停止")
+        self.btn_stop.setObjectName("stopBtn")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
-        lay.addWidget(self.btn_stop)
+        root.addWidget(self.btn_stop)
 
         self.progress = QProgressBar()
-        lay.addWidget(self.progress)
-        lay.addStretch()
+        self.progress.setTextVisible(True)
+        root.addWidget(self.progress)
+
+        # 开发者署名移到左侧底部
+        dev_lbl = QLabel(
+            '由 <a href="https://karcen.github.io/zhengjiacheng.github.io/"'
+            ' style="color:#0078d4;text-decoration:none;">Karcen Zheng</a>'
+            ' 使用 Claude Code 辅助开发')
+        dev_lbl.setOpenExternalLinks(True)
+        dev_lbl.setStyleSheet("font-size:10px; color:#aaa;")
+        dev_lbl.setAlignment(Qt.AlignCenter)
+        root.addWidget(dev_lbl)
+
+        return w
         return w
 
     def _build_right(self) -> QWidget:
@@ -227,6 +293,15 @@ class MainWindow(QMainWindow):
             'analyze_t1':  self.chk_t1.isChecked(),
             'analyze_dti': self.chk_dti.isChecked(),
             'analyze_qsm': self.chk_qsm.isChecked(),
+            # 高级预处理
+            'motion_correction':    self.chk_motion.isChecked(),
+            'nuisance_regression':  self.chk_nuisance.isChecked(),
+            'motion_24':            self.chk_motion24.isChecked(),
+            'wm_csf':               self.chk_wm_csf.isChecked(),
+            'gsr':                  self.chk_gsr.isChecked(),
+            'carpet_plot':          self.chk_carpet.isChecked(),
+            'schaefer':             self.chk_schaefer.isChecked(),
+            'schaefer_n': int(self.cmb_schaefer.currentText().split()[0]),
         }
         self._log("=" * 60)
         self._log("开始多模态脑影像分析...")
