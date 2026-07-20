@@ -79,10 +79,13 @@ SEQ_PATTERNS = {
 class BrainAnalyzer:
     """完整 fMRI 分析引擎 — 从 DICOM 到报告"""
 
-    def __init__(self, dicom_path: str, output_dir: str, progress_cb=None):
+    def __init__(self, dicom_path: str, output_dir: str, progress_cb=None,
+                 fmriprep_dir: str = None):
         self.dicom_root  = dicom_path
         self.output_dir  = output_dir
         self.progress_cb = progress_cb or (lambda p, m: print(f"[{p:3d}%] {m}"))
+        # 当提供 fMRIPrep derivatives 目录时，跳过 DICOM 转换与内置预处理
+        self.fmriprep_dir = fmriprep_dir
 
         self.nifti_dir   = os.path.join(output_dir, "nifti")
         self.results_dir = os.path.join(output_dir, "results")
@@ -97,12 +100,18 @@ class BrainAnalyzer:
         self.TR:           float = 2.0
         self.slice_timing: list  = []
 
-        self.progress_cb(1, "自动识别序列...")
-        self.sequences   = self._detect_sequences()
-        self.bold_folder = self.sequences.get("bold")
-        if not self.bold_folder:
-            raise RuntimeError("未找到 fMRI BOLD 序列。")
-        self.progress_cb(3, f"识别 BOLD 序列: {os.path.basename(self.bold_folder)}")
+        if self.fmriprep_dir:
+            # fMRIPrep 模式：无需 DICOM，序列检测跳过
+            self.progress_cb(1, "fMRIPrep 模式：使用预处理好的 derivatives...")
+            self.sequences   = {}
+            self.bold_folder = None
+        else:
+            self.progress_cb(1, "自动识别序列...")
+            self.sequences   = self._detect_sequences()
+            self.bold_folder = self.sequences.get("bold")
+            if not self.bold_folder:
+                raise RuntimeError("未找到 fMRI BOLD 序列。")
+            self.progress_cb(3, f"识别 BOLD 序列: {os.path.basename(self.bold_folder)}")
 
     # ── 序列检测 ──────────────────────────────────────────────────────────────
 
@@ -899,18 +908,57 @@ class BrainAnalyzer:
             })
             cfg.save_yaml()
 
-            nifti, sidecar = self.convert_dicom_to_nifti()
-            results.update({"nifti_file": nifti, "scan_params": self.scan_params,
-                             "sidecar": sidecar})
-
-            # ── 基础预处理 ─────────────────────────────────────────────────
-            pre  = self.preprocess(nifti)
-            results["preprocessed"] = pre
-
-            # ── 运动估计（相位相关法）────────────────────────────────────────
+            # ══ 输入分支：fMRIPrep 金标准数据 vs 内置管线 ══════════════════════
+            fmriprep_mode = bool(getattr(self, "fmriprep_dir", None))
             motion_params = None
             fd_mm = None
-            if options.get("motion_correction", True):
+
+            if fmriprep_mode:
+                # ── 使用 fMRIPrep 预处理好的 derivatives（金标准）─────────────
+                self.progress_cb(10, "检测到 fMRIPrep 数据，使用金标准预处理结果...")
+                from core.fmriprep_loader import FMRIPrepLoader
+                loader = FMRIPrepLoader(self.fmriprep_dir)
+                subjects = loader.detect_subjects()
+                if not subjects:
+                    raise RuntimeError(f"fMRIPrep 目录未找到受试者: {self.fmriprep_dir}")
+                subj = getattr(self, "fmriprep_subject", None) or subjects[0]
+                files = loader.find_bold(subj)
+                if not files.get("bold"):
+                    raise RuntimeError(f"未找到 {subj} 的 preproc_bold（MNI 空间）")
+
+                strategy = options.get("confound_strategy", "24P")
+                pre = loader.clean_bold(files, self.results_dir,
+                                        TR=self.TR, strategy=strategy,
+                                        progress_cb=self.progress_cb)
+                self.scan_params.update({
+                    "subject_id": subj.replace("sub-", ""),
+                    "preproc_backbone": "fMRIPrep (金标准)",
+                    "confound_strategy": strategy,
+                })
+                results.update({"nifti_file": files["bold"],
+                                "scan_params": self.scan_params,
+                                "fmriprep_subject": subj,
+                                "preproc_backbone": "fmriprep"})
+                results["preprocessed"] = pre
+                if files.get("confounds"):
+                    try:
+                        fd_mm = loader.get_fd(files["confounds"])
+                        results["fd_mm"] = fd_mm.tolist()
+                    except Exception as e:
+                        self.progress_cb(12, f"FD 读取跳过: {e}")
+            else:
+                # ── 内置管线（无 fMRIPrep 时的兜底方案）──────────────────────
+                nifti, sidecar = self.convert_dicom_to_nifti()
+                results.update({"nifti_file": nifti, "scan_params": self.scan_params,
+                                 "sidecar": sidecar,
+                                 "preproc_backbone": "builtin"})
+
+                # ── 基础预处理 ─────────────────────────────────────────────
+                pre  = self.preprocess(nifti)
+                results["preprocessed"] = pre
+
+            # ── 运动估计（相位相关法）— 仅内置管线需要 ─────────────────────────
+            if not fmriprep_mode and options.get("motion_correction", True):
                 try:
                     self.progress_cb(35, "运动估计（相位相关法）...")
                     from core.advanced_preprocessing import MotionEstimator
@@ -1044,7 +1092,8 @@ class BrainAnalyzer:
                 self.progress_cb(90, "生成报告文档...")
                 from core.report_generator import ReportGenerator
                 rg = ReportGenerator(results, self.output_dir,
-                                     scan_params=self.scan_params)
+                                     scan_params=self.scan_params,
+                                     update_literature=options.get("update_literature", False))
                 reports: dict = {}
                 if options.get("pdf"):
                     reports["pdf"] = rg.generate_pdf_report("zh")
