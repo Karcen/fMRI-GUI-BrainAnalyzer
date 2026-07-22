@@ -108,6 +108,21 @@ def _fc_strength(r, zh=True):
     return '弱' if zh else 'very weak'
 
 
+def _fc_vs_ref(val, lo, hi, ref_str, zh=True):
+    """FC 值与参考区间比较 → 散文短语（偏低↓/正常✓/偏高↑）。
+    示例（zh=True）：'低于文献参考范围（r≈0.5–0.6），偏低↓'
+    示例（zh=False）：'below the reference range (r≈0.5–0.6) ↓'
+    """
+    if zh:
+        if val > hi:  return f"高于文献参考范围（r≈{ref_str}），偏高↑"
+        if val >= lo: return f"处于文献参考范围内（r≈{ref_str}），正常✓"
+        return          f"低于文献参考范围（r≈{ref_str}），偏低↓"
+    else:
+        if val > hi:  return f"above the reference range (r≈{ref_str}) ↑"
+        if val >= lo: return f"within the reference range (r≈{ref_str}) ✓"
+        return          f"below the reference range (r≈{ref_str}) ↓"
+
+
 def _parse_age(age_raw):
     """DICOM PatientAge（如 '025Y' / '25' / 'N/A'）→ int 岁；无法解析返回 None。"""
     if age_raw is None:
@@ -525,10 +540,14 @@ class ReportGenerator:
         pcc_prec = 0.0
         if "PCC" in roi_names and "Precuneus" in roi_names:
             pcc_prec = float(FC[roi_names.index("PCC"), roi_names.index("Precuneus")])
+        _prec_cap_txt = (
+            "后部核心回路连接正常✓" if pcc_prec >= 0.5
+            else ("中等连接，后部回路偏弱" if pcc_prec >= 0.2
+                  else "连接偏低↓，提示后部核心回路连接减弱"))
         story.append(Paragraph(
             f"图3：DMN7个核心节点内部功能连接矩阵。颜色深红代表强正相关，深蓝代表强负相关。"
-            f"PCC-Precuneus连接（r={pcc_prec:.3f}）为本受试者最强DMN内部连接，"
-            "提示DMN后部核心回路完整。", S_CAP))
+            f"PCC-Precuneus连接（r={pcc_prec:.3f}）：{_prec_cap_txt}"
+            f"（健康成人参考r≈0.5–0.6）。", S_CAP))
         story.append(Spacer(1, 0.3*cm))
 
         # 5.3 DMN 神经科学解释
@@ -549,9 +568,11 @@ class ReportGenerator:
         story += [Spacer(1, 0.2*cm),
                   Paragraph(
                       f"本受试者PCC-Precuneus连接（r={pcc_prec:.3f}）"
-                      f"{'显著高于' if pcc_prec > 0.6 else '处于'}文献报道的健康成人均值（r≈0.5–0.6），"
-                      f"而PCC-mPFC连接（r={pcc_mpfc:.3f}）处于正常范围。"
-                      f"DMN整体内部连接强度（r={dmn_str:.3f}）在文献参考范围内（健康成人r≈0.2–0.5）。",
+                      f"{_fc_vs_ref(pcc_prec, 0.5, 0.6, '0.5–0.6')}；"
+                      f"PCC-mPFC连接（r={pcc_mpfc:.3f}）"
+                      f"{_fc_vs_ref(pcc_mpfc, 0.2, 0.5, '0.2–0.5')}；"
+                      f"DMN整体内部连接强度（r={dmn_str:.3f}）"
+                      f"{_fc_vs_ref(dmn_str, 0.2, 0.5, '0.2–0.5')}（健康成人典型范围）。",
                       S_BODY),
                   PageBreak()]
 
@@ -1232,6 +1253,9 @@ class ReportGenerator:
         FC_dmn    = FC[np.ix_(dmn_idx, dmn_idx)] if len(dmn_idx)>1 else np.zeros((1,1))
         dmn_str   = float(FC_dmn[np.triu_indices(len(dmn_idx), k=1)].mean()) if len(dmn_idx)>1 else 0.0
         hubs      = gm.get('hub_regions', [])
+        pcc_i_en    = roi_names.index('PCC') if 'PCC' in roi_names else 0
+        pcc_prec_en = float(FC[pcc_i_en, roi_names.index('Precuneus')]) if 'Precuneus' in roi_names else 0.0
+        pcc_mpfc_en = float(FC[pcc_i_en, roi_names.index('mPFC')])      if 'mPFC'      in roi_names else 0.0
 
         # 6. Whole-Brain FC ───────────────────────────────────────────────────
         fc_nz = FC[FC!=0]
@@ -1338,16 +1362,23 @@ class ReportGenerator:
                   Spacer(1, 0.3*cm),
                   Paragraph('10.1 Consistency with Literature', S_H2),
                   Paragraph(
-                      f"The brain network exhibits small-world topology (σ={gm.get('small_world_sigma',0):.2f}), "
-                      f"global efficiency GE={gm.get('global_efficiency',0):.3f}, "
-                      f"and DMN internal FC r={dmn_str:.3f}, "
-                      f"consistent with large-sample healthy-adult neuroimaging studies "
-                      f"(Bullmore & Sporns 2009; Power et al. 2011).", S_BODY),
+                      f"Small-world topology: σ={gm.get('small_world_sigma',0):.2f} "
+                      f"({'small-world ✓' if gm.get('small_world_sigma',0)>1 else 'not small-world (σ≤1)'}). "
+                      f"Global efficiency GE={gm.get('global_efficiency',0):.3f} — "
+                      f"{_fc_vs_ref(gm.get('global_efficiency',0), 0.5, 0.8, '0.5–0.8', zh=False)}. "
+                      f"DMN internal FC r={dmn_str:.3f} — "
+                      f"{_fc_vs_ref(dmn_str, 0.2, 0.5, '0.2–0.5', zh=False)}. "
+                      f"(Bullmore & Sporns 2009; Power et al. 2011)", S_BODY),
                   Paragraph('10.2 Notable Features', S_H2)]
+        _pcc_prec_en_txt = (
+            f"strong connectivity (r={pcc_prec_en:.3f}) ✓" if pcc_prec_en >= 0.5
+            else (f"moderate connectivity (r={pcc_prec_en:.3f}), below typical range" if pcc_prec_en >= 0.2
+                  else f"reduced connectivity (r={pcc_prec_en:.3f}) ↓"))
         story.append(_bul([
             f"Hub regions: {', '.join(hubs) if hubs else 'None detected'}",
-            f"Dynamic FC flexibility: {dfc.get('n_transitions',0)} state transition(s) over 8 min",
-            "Posterior DMN core circuit (PCC–Precuneus) shows strong connectivity",
+            f"Dynamic FC flexibility: {dfc.get('n_transitions',0)} state transition(s) "
+            f"over {dfc.get('total_duration_min', 8):.0f} min",
+            f"Posterior DMN core circuit (PCC–Precuneus): {_pcc_prec_en_txt} (ref. r≈0.5–0.6)",
         ]))
         # 10.x Auto-updated recent literature (optional, online) ──────────────
         if self.update_literature:
@@ -1603,12 +1634,23 @@ class ReportGenerator:
                  '参考（成人）' if zh else 'Reference (Adult)', '评价' if zh else 'Rating'],
                 ['脑总体积 (cc)' if zh else 'Total brain vol.',
                  f"{t1.get('brain_vol_cc',0):.0f}",
-                 '1350–1500', '正常' if 1350 <= t1.get('brain_vol_cc',0) <= 1500 else '偏小/大'],
-                ['灰质 GM (cc)',  f"{t1.get('gm_vol_cc',0):.0f}",  '650–780', '—'],
-                ['白质 WM (cc)',  f"{t1.get('wm_vol_cc',0):.0f}",  '450–600', '—'],
-                ['CSF (cc)',      f"{t1.get('csf_vol_cc',0):.0f}",  '100–200', '—'],
-                ['GM/WM 比值',   f"{t1.get('gm_wm_ratio',0):.3f}", '1.2–1.5', '—'],
-                ['半球对称性',   f"{t1.get('symmetry_index',0):.3f}", '>0.92良好','—'],
+                 '1350–1500', _verdict_range(t1.get('brain_vol_cc'), 1350, 1500, zh)],
+                ['灰质 GM (cc)' if zh else 'Grey matter (cc)',
+                 f"{t1.get('gm_vol_cc',0):.0f}",  '650–780',
+                 _verdict_range(t1.get('gm_vol_cc'), 650, 780, zh)],
+                ['白质 WM (cc)' if zh else 'White matter (cc)',
+                 f"{t1.get('wm_vol_cc',0):.0f}",  '450–600',
+                 _verdict_range(t1.get('wm_vol_cc'), 450, 600, zh)],
+                ['CSF (cc)',
+                 f"{t1.get('csf_vol_cc',0):.0f}",  '100–200',
+                 _verdict_range(t1.get('csf_vol_cc'), 100, 200, zh)],
+                ['GM/WM 比值' if zh else 'GM/WM ratio',
+                 f"{t1.get('gm_wm_ratio',0):.3f}", '1.2–1.5',
+                 _verdict_range(t1.get('gm_wm_ratio'), 1.2, 1.5, zh)],
+                ['半球对称性' if zh else 'Hemispheric symmetry',
+                 f"{t1.get('symmetry_index',0):.3f}", '>0.92',
+                 ('良好✓' if t1.get('symmetry_index', 0) >= 0.92 else '偏低↓') if zh
+                 else ('Good✓' if t1.get('symmetry_index', 0) >= 0.92 else 'Low↓')],
             ]
             story.append(_tbl(row, cw=[5*cm,3*cm,4*cm,6*cm]))
             story += [Spacer(1,0.2*cm),
