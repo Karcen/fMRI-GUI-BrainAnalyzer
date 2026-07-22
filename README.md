@@ -180,6 +180,7 @@ This software is provided "as is" for scientific research and educational purpos
 ---
 
 由 [Jiacheng Zheng](https://karcen.github.io/zhengjiacheng.github.io/) 使用 Claude Code 辅助开发 · © 2026 NeuroLab
+
 Developed by [Jiacheng Zheng](https://karcen.github.io/zhengjiacheng.github.io/) with Claude Code · © 2026 NeuroLab
 
 
