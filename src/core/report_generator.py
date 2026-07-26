@@ -4,7 +4,9 @@
 报告生成器 v2.0 — 中文 PDF + Word
 """
 
-import os, json
+import html
+import json
+import os
 from datetime import datetime
 import numpy as np
 
@@ -17,8 +19,11 @@ from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 # ── 字体注册 ──────────────────────────────────────────────────────────────────
 def _register():
@@ -37,6 +42,7 @@ def _register():
     return 'Helvetica', 'Helvetica-Bold'
 
 CN, CNB = _register()
+WORD_CN_FONT = 'Hiragino Sans GB'
 
 # ── 样式 ─────────────────────────────────────────────────────────────────────
 def _s(name, font=None, size=10, leading=14, c=colors.black, bold=False, sb=0, sa=4):
@@ -52,6 +58,8 @@ S_BODY  = _s('bd',  size=9,  leading=13)
 S_BOLD  = _s('bl',  size=9,  bold=True,   leading=13)
 S_CAP   = _s('cp',  size=8,  leading=11,  c=colors.grey)
 S_NOTE  = _s('nt',  size=8,  leading=11,  c=colors.HexColor('#B71C1C'))
+S_TBL   = _s('tb',  size=7.5, leading=9.5)
+S_TBL_H = _s('th',  size=7.5, leading=9.5, bold=True, c=colors.white)
 
 def _hr(): return HRFlowable(width="100%", thickness=0.5,
                               color=colors.HexColor('#BBDEFB'), spaceAfter=4)
@@ -59,10 +67,44 @@ def _img(p, w=14*cm):
     if p and os.path.exists(p): return Image(p, width=w, height=w*0.55)
     return Paragraph(f"[图像未找到: {os.path.basename(p) if p else '?'}]", S_CAP)
 def _tbl(data, cw=None, hdr=True):
-    t = Table(data, colWidths=cw)
+    """创建可换行且不会超出 A4 正文宽度的表格。
+
+    ReportLab 对普通字符串单元格不会自动按 CJK 文本可靠换行；旧实现还允许
+    colWidths 总和超过 A4 在 2 cm 页边距下的 17 cm 正文宽度，二者共同导致
+    文字越过表格边界。这里统一把单元格转换为 Paragraph，并按正文宽度缩放列宽。
+    """
+    if not data:
+        return Table([])
+    n_cols = max(len(row) for row in data)
+    max_width = 17 * cm
+    if cw is None:
+        cw = [max_width / n_cols] * n_cols
+    else:
+        cw = list(cw)
+        total = sum(cw)
+        if total > max_width:
+            scale = max_width / total
+            cw = [w * scale for w in cw]
+
+    wrapped = []
+    for row_idx, row in enumerate(data):
+        out_row = []
+        for value in row:
+            if isinstance(value, Paragraph):
+                out_row.append(value)
+                continue
+            text = "" if value is None else str(value)
+            text = html.escape(text).replace("\n", "<br/>")
+            out_row.append(Paragraph(text, S_TBL_H if hdr and row_idx == 0 else S_TBL))
+        out_row.extend(Paragraph("", S_TBL) for _ in range(n_cols - len(out_row)))
+        wrapped.append(out_row)
+
+    t = Table(wrapped, colWidths=cw, repeatRows=1 if hdr else 0,
+              splitByRow=1, hAlign='CENTER')
     cmds = [('FONTNAME',(0,0),(-1,-1),CN),('FONTSIZE',(0,0),(-1,-1),8),
             ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#F5F5F5')]),
             ('GRID',(0,0),(-1,-1),0.5,colors.grey),('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+            ('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),
             ('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]
     if hdr: cmds += [('BACKGROUND',(0,0),(-1,0),colors.HexColor('#1565C0')),
                      ('FONTNAME',(0,0),(-1,0),CNB),('TEXTCOLOR',(0,0),(-1,0),colors.white)]
@@ -149,7 +191,8 @@ def _parse_age(age_raw):
     return v if 0 < v < 130 else None
 
 
-# ── 图论全局指标：真实值 vs 健康成人参考范围 → (参考文字, 判读) ─────────────────
+# ── 图论全局指标：真实值 vs 项目预设参考区间 → (参考文字, 判读) ─────────────────
+# 这些区间用于当前固定流程的探索性内部判读，不是跨图谱/阈值通用的临床常模。
 _GRAPH_REF = {
     # metric_key: (lo, hi, 参考文字_zh, 参考文字_en)
     'mean_degree':       (12, 20,   '~12–20（阈值依赖）', '~12–20'),
@@ -175,6 +218,54 @@ def _graph_interp(metric, val, zh=True):
     if val < lo:  return '偏低' if zh else 'Below range'
     if val > hi:  return '偏高' if zh else 'Above range'
     return '正常范围' if zh else 'Normal range'
+
+
+def _graph_range_feature(metric, label_zh, label_en, val, direction):
+    """生成无歧义的图论阈值描述，并返回（中文、英文、是否命中）。
+
+    疾病文献通常报告相对组间升高/降低，并不提供可跨流程套用的绝对阈值。
+    此处仅使用第八章同一套项目参考区间，保证报告内部口径一致。
+    """
+    lo, hi, ref_zh, ref_en = _GRAPH_REF[metric]
+    valid = val is not None and np.isfinite(val) and val > 0
+    if not valid:
+        return (
+            f"{label_zh}未获得有效值，无法与项目参考区间{ref_zh}比较",
+            f"No valid {label_en} value; comparison with project reference "
+            f"range {ref_en} is unavailable",
+            False,
+        )
+
+    if direction == 'low':
+        hit = val < lo
+        if hit:
+            zh_state = f"低于项目参考下限{lo:.2f}，属于偏低"
+            en_state = f"below the project lower bound {lo:.2f} (low)"
+        elif val <= hi:
+            zh_state = f"位于项目参考区间{ref_zh}，不属于偏低"
+            en_state = f"within the project reference range {ref_en} (not low)"
+        else:
+            zh_state = f"高于项目参考上限{hi:.2f}，不属于偏低"
+            en_state = f"above the project upper bound {hi:.2f} (not low)"
+    elif direction == 'high':
+        hit = val > hi
+        if hit:
+            zh_state = f"高于项目参考上限{hi:.2f}，属于偏高"
+            en_state = f"above the project upper bound {hi:.2f} (high)"
+        elif val >= lo:
+            zh_state = f"位于项目参考区间{ref_zh}，不属于偏高"
+            en_state = f"within the project reference range {ref_en} (not high)"
+        else:
+            zh_state = f"低于项目参考下限{lo:.2f}，不属于偏高"
+            en_state = f"below the project lower bound {lo:.2f} (not high)"
+    else:
+        raise ValueError(f"Unsupported graph feature direction: {direction}")
+
+    return (
+        f"{label_zh}={val:.3f}，{zh_state}",
+        f"{label_en}={val:.3f}, {en_state}",
+        hit,
+    )
 
 
 class ReportGenerator:
@@ -265,9 +356,9 @@ class ReportGenerator:
 
     def disease_similarity(self):
         """
-        规则化疾病相似度引擎（数据驱动，可解释）。
+        规则化疾病文献对照引擎（数据驱动，可解释）。
         每种疾病定义若干布尔特征，全部由本受试者真实指标算出；
-        相似度 = 命中数/总数，单受试者封顶『中度』，绝不给出高相似度或诊断。
+        仅返回预设探索性规则的命中数，不生成疾病相似度等级或诊断结论。
         返回 {疾病key: {'zh_name','en_name','features':[(zh,en,hit)],
                         'level_zh','level_en','note_zh','note_en'}}
         """
@@ -288,81 +379,91 @@ class ReportGenerator:
         amy_dlpfc = self._fc('L_Amy', 'L_dlPFC')
         mpfc_amy  = self._fc('mPFC', 'L_Amy')
         age = _parse_age(self.sp.get('age'))
+        ge_low_feature = _graph_range_feature(
+            'global_efficiency', '全局效率GE', 'Global efficiency GE', ge, 'low')
+        cc_high_feature = _graph_range_feature(
+            'avg_clustering', '局部聚类CC', 'Clustering CC', cc, 'high')
 
         def hub_any(*names):  return any(n in hubs for n in names)
 
         # 每种疾病：(zh特征, en特征, 命中布尔) —— 命中判据全部基于真实指标
         rules = {
             "MDD": ("重度抑郁症", "Major Depressive Disorder", [
-                (f"DMN内部FC偏高(={dmn:.3f}>0.35)", f"DMN internal FC high (={dmn:.3f})", dmn > 0.35),
-                (f"动态FC灵活性偏低(={n_trans}次<3)", f"Low dFC flexibility ({n_trans}<3)", has_dfc and n_trans < 3),
+                (f"DMN内部FC={dmn:.3f}（偏高阈值>0.35）",
+                 f"DMN internal FC={dmn:.3f} (high threshold >0.35)", dmn > 0.35),
+                (f"动态FC状态转换={n_trans}次（偏低阈值<3次）",
+                 f"dFC transitions={n_trans} (low-flexibility threshold <3)", has_dfc and n_trans < 3),
                 ("边缘系统节点为Hub(杏仁核/丘脑)", "Limbic hub (amygdala/thalamus)", hub_any('L_Amy','R_Amy','L_Thal','R_Thal')),
             ]),
             "BD": ("双相情感障碍", "Bipolar Disorder", [
-                (f"ECN内部FC偏离(={ecn_fc:.3f})", f"ECN FC atypical (={ecn_fc:.3f})", ecn_fc < 0.2 or ecn_fc > 0.5),
+                (f"ECN内部FC={ecn_fc:.3f}（异常阈值<0.2或>0.5）",
+                 f"ECN FC={ecn_fc:.3f} (atypical if <0.2 or >0.5)", ecn_fc < 0.2 or ecn_fc > 0.5),
                 ("杏仁核为Hub(边缘-PFC耦合)", "Amygdala hub", hub_any('L_Amy','R_Amy')),
             ]),
             "SCZ": ("精神分裂症", "Schizophrenia", [
-                (f"PCC-mPFC连接减弱(={(pcc_mpfc if pcc_mpfc is not None else 0):.3f}<0.2)",
-                 f"PCC-mPFC reduced (<0.2)", pcc_mpfc is not None and pcc_mpfc < 0.2),
-                (f"小世界性下降(σ={sigma:.2f}<1)", f"Small-worldness down (σ<1)", 0 < sigma < 1.0),
+                (f"PCC-mPFC连接={(pcc_mpfc if pcc_mpfc is not None else 0):.3f}（减弱阈值<0.2）",
+                 f"PCC-mPFC={(pcc_mpfc if pcc_mpfc is not None else 0):.3f} (reduced threshold <0.2)",
+                 pcc_mpfc is not None and pcc_mpfc < 0.2),
+                (f"小世界指数σ={sigma:.2f}（下降阈值<1）",
+                 f"Small-worldness σ={sigma:.2f} (reduced threshold <1)", 0 < sigma < 1.0),
             ]),
             "ADHD": ("注意缺陷多动障碍", "ADHD", [
-                (f"DAN内部FC偏低(={dan_fc:.3f}<0.2)", f"DAN FC low (<0.2)", dan_fc < 0.2),
-                (f"全局效率偏低(GE={ge:.3f}<0.5)", f"Global efficiency low (<0.5)", 0 < ge < 0.5),
-                ("执行网络节点(dlPFC)非Hub", "dlPFC not a hub", not hub_any('L_dlPFC','R_dlPFC')),
+                (f"DAN内部FC={dan_fc:.3f}（项目探索性规则：<0.2）",
+                 f"DAN FC={dan_fc:.3f} (exploratory project rule: <0.2)", dan_fc < 0.2),
+                ge_low_feature,
+                ("执行网络节点(dlPFC)非Hub（项目探索性规则）",
+                 "dlPFC not a hub (exploratory project rule)",
+                 not hub_any('L_dlPFC','R_dlPFC')),
             ]),
             "ASD": ("孤独症谱系", "Autism Spectrum", [
-                (f"局部聚类偏高(CC={cc:.3f}>0.6)", f"High clustering (CC>0.6)", cc > 0.6),
-                (f"过度局部化(σ={sigma:.2f}>2)", f"Over-segregation (σ>2)", sigma > 2.0),
+                cc_high_feature,
+                (f"小世界指数σ={sigma:.2f}（过度局部化阈值>2）",
+                 f"Small-worldness σ={sigma:.2f} (over-segregation threshold >2)", sigma > 2.0),
             ]),
             "GAD": ("广泛性焦虑障碍", "Generalized Anxiety", [
                 ("杏仁核为Hub(高连接)", "Amygdala hub", hub_any('L_Amy','R_Amy')),
-                (f"SN内部FC偏高(={sn_fc:.3f}>0.35)", f"SN FC high (>0.35)", sn_fc > 0.35),
-                (f"杏仁核-dlPFC调控弱(={(amy_dlpfc if amy_dlpfc is not None else 0):.3f}<0.15)",
-                 f"Amygdala-dlPFC weak (<0.15)", amy_dlpfc is not None and amy_dlpfc < 0.15),
+                (f"SN内部FC={sn_fc:.3f}（偏高阈值>0.35）",
+                 f"SN FC={sn_fc:.3f} (high threshold >0.35)", sn_fc > 0.35),
+                (f"杏仁核-dlPFC连接={(amy_dlpfc if amy_dlpfc is not None else 0):.3f}（调控弱阈值<0.15）",
+                 f"Amygdala-dlPFC={(amy_dlpfc if amy_dlpfc is not None else 0):.3f} (weak threshold <0.15)",
+                 amy_dlpfc is not None and amy_dlpfc < 0.15),
             ]),
             "OCD": ("强迫症", "OCD", [
                 ("尾状核为Hub(皮层-纹状体回路)", "Caudate hub", hub_any('L_Caudate','R_Caudate')),
-                (f"SN内部FC偏高(={sn_fc:.3f}>0.35)", f"SN FC high (>0.35)", sn_fc > 0.35),
+                (f"SN内部FC={sn_fc:.3f}（偏高阈值>0.35）",
+                 f"SN FC={sn_fc:.3f} (high threshold >0.35)", sn_fc > 0.35),
             ]),
             "PTSD": ("创伤后应激障碍", "PTSD", [
                 ("杏仁核为Hub(过反应性)", "Amygdala hub", hub_any('L_Amy','R_Amy')),
-                (f"mPFC-杏仁核调控弱(={(mpfc_amy if mpfc_amy is not None else 0):.3f}<0.15)",
-                 f"mPFC-amygdala weak (<0.15)", mpfc_amy is not None and mpfc_amy < 0.15),
+                (f"mPFC-杏仁核连接={(mpfc_amy if mpfc_amy is not None else 0):.3f}（调控弱阈值<0.15）",
+                 f"mPFC-amygdala={(mpfc_amy if mpfc_amy is not None else 0):.3f} (weak threshold <0.15)",
+                 mpfc_amy is not None and mpfc_amy < 0.15),
             ]),
             "AD": ("阿尔茨海默病", "Alzheimer's Disease", [
-                (f"DMN严重破坏(PCC-mPFC={(pcc_mpfc if pcc_mpfc is not None else 0):.3f}<0.1)",
-                 f"DMN disrupted (PCC-mPFC<0.1)", pcc_mpfc is not None and pcc_mpfc < 0.1),
-                (f"全局效率急剧下降(GE={ge:.3f}<0.4)", f"GE sharply reduced (<0.4)", 0 < ge < 0.4),
+                (f"PCC-mPFC连接={(pcc_mpfc if pcc_mpfc is not None else 0):.3f}（DMN严重破坏阈值<0.1）",
+                 f"PCC-mPFC={(pcc_mpfc if pcc_mpfc is not None else 0):.3f} (severe DMN disruption threshold <0.1)",
+                 pcc_mpfc is not None and pcc_mpfc < 0.1),
+                ge_low_feature,
             ]),
             "PD": ("帕金森病", "Parkinson's Disease", [
-                (f"感觉运动网络改变(SMN={smn_fc:.3f})", f"SMN altered (={smn_fc:.3f})", smn_fc < 0.2 or smn_fc > 0.5),
+                (f"感觉运动网络SMN={smn_fc:.3f}（异常阈值<0.2或>0.5）",
+                 f"SMN={smn_fc:.3f} (atypical if <0.2 or >0.5)", smn_fc < 0.2 or smn_fc > 0.5),
                 ("基底节节点为Hub", "Basal ganglia hub", hub_any('L_Caudate','R_Caudate')),
             ]),
         }
-
-        def level(ratio, zh):
-            # 单受试者上限『中度』——绝不给出高相似度。
-            # 阈值保守：≥0.6 才『中度』(如 2/2、2/3)，命中即『低』，未命中『极低』。
-            if ratio <= 0:      return '极低' if zh else 'Very low'
-            if ratio < 0.6:     return '低'   if zh else 'Low'
-            return '中度' if zh else 'Moderate'
 
         out = {}
         for key, (zh_n, en_n, feats) in rules.items():
             n_hit = sum(1 for _, _, h in feats if h)
             n_tot = len(feats)
-            ratio = n_hit / n_tot if n_tot else 0
-            lv_zh, lv_en = level(ratio, True), level(ratio, False)
-            note_zh = f"命中 {n_hit}/{n_tot} 项特征"
-            note_en = f"{n_hit}/{n_tot} features matched"
-            # 年龄门控：AD/PD 明显不符发病年龄 → 强制极低
+            lv_zh = f"{n_hit}/{n_tot}项规则命中"
+            lv_en = f"{n_hit}/{n_tot} exploratory rules matched"
+            note_zh = "项目预设探索性规则；非诊断"
+            note_en = "Preset exploratory project rules; non-diagnostic"
+            # 年龄只作为附加背景说明，不再覆盖成疾病相似度等级。
             if key == 'AD' and age is not None and age < 50:
-                lv_zh, lv_en = '极低', 'Very low'
                 note_zh += f"；年龄{age}岁远低于AD典型发病"; note_en += f"; age {age}, atypical for AD"
             if key == 'PD' and age is not None and age < 45:
-                lv_zh, lv_en = '极低', 'Very low'
                 note_zh += f"；年龄{age}岁不符PD发病特征"; note_en += f"; age {age}, atypical for PD"
             out[key] = {'zh_name': zh_n, 'en_name': en_n, 'features': feats,
                         'n_hit': n_hit, 'n_tot': n_tot,
@@ -377,10 +478,265 @@ class ReportGenerator:
         if score>=40: return '一般' if lang=='zh' else 'Fair'
         return '较差' if lang=='zh' else 'Poor'
 
-    # ── PDF ──────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _set_word_font(run, size=9, bold=None, color=None):
+        """同时设置西文与东亚字体，避免中文在 Word/LibreOffice 中回退异常。"""
+        run.font.name = WORD_CN_FONT
+        run.font.size = Pt(size)
+        if bold is not None:
+            run.bold = bold
+        if color is not None:
+            run.font.color.rgb = RGBColor(*color)
+        rpr = run._element.get_or_add_rPr()
+        rfonts = rpr.rFonts
+        if rfonts is None:
+            rfonts = OxmlElement('w:rFonts')
+            rpr.insert(0, rfonts)
+        rfonts.set(qn('w:ascii'), WORD_CN_FONT)
+        rfonts.set(qn('w:hAnsi'), WORD_CN_FONT)
+        rfonts.set(qn('w:eastAsia'), WORD_CN_FONT)
+
+    @staticmethod
+    def _word_cell_margins(cell, top=70, start=90, bottom=70, end=90):
+        tc_pr = cell._tc.get_or_add_tcPr()
+        tc_mar = tc_pr.first_child_found_in('w:tcMar')
+        if tc_mar is None:
+            tc_mar = OxmlElement('w:tcMar')
+            tc_pr.append(tc_mar)
+        for edge, value in (('top', top), ('start', start),
+                            ('bottom', bottom), ('end', end)):
+            node = tc_mar.find(qn(f'w:{edge}'))
+            if node is None:
+                node = OxmlElement(f'w:{edge}')
+                tc_mar.append(node)
+            node.set(qn('w:w'), str(value))
+            node.set(qn('w:type'), 'dxa')
+
+    @staticmethod
+    def _word_repeat_header(row):
+        tr_pr = row._tr.get_or_add_trPr()
+        tbl_header = OxmlElement('w:tblHeader')
+        tbl_header.set(qn('w:val'), 'true')
+        tr_pr.append(tbl_header)
+
+    @staticmethod
+    def _flowable_plain_text(value):
+        if isinstance(value, Paragraph):
+            return value.getPlainText()
+        if hasattr(value, 'getPlainText'):
+            try:
+                return value.getPlainText()
+            except Exception:
+                pass
+        return '' if value is None else str(value)
+
+    def _write_story_docx(self, story, fp, language='zh'):
+        """把 PDF 使用的同一组 ReportLab flowables 转为可编辑 DOCX。
+
+        章节、段落、表格、图片和分页均来自同一 story，因此 Word/PDF 不再维护
+        两套互相漂移的正文。转换只负责呈现差异，不改写任何报告内容。
+        """
+        doc = Document()
+        sec = doc.sections[0]
+        sec.page_width = Cm(21.0)
+        sec.page_height = Cm(29.7)
+        sec.left_margin = Cm(2.0)
+        sec.right_margin = Cm(2.0)
+        sec.top_margin = Cm(2.0)
+        sec.bottom_margin = Cm(2.0)
+
+        doc.core_properties.title = (
+            '静息态fMRI脑网络分析报告' if language == 'zh'
+            else 'Resting-State fMRI Brain Network Analysis Report')
+        doc.core_properties.author = 'Brain Analyzer — Karcen Zheng'
+
+        for style_name, size, bold, color in [
+            ('Normal', 9, False, (0, 0, 0)),
+            ('Title', 22, True, (26, 35, 126)),
+            ('Heading 1', 14, True, (21, 101, 192)),
+            ('Heading 2', 11, True, (2, 119, 189)),
+            ('Caption', 8, False, (96, 96, 96)),
+        ]:
+            style = doc.styles[style_name]
+            style.font.name = WORD_CN_FONT
+            style.font.size = Pt(size)
+            style.font.bold = bold
+            style.font.color.rgb = RGBColor(*color)
+            rpr = style._element.get_or_add_rPr()
+            rfonts = rpr.rFonts
+            if rfonts is None:
+                rfonts = OxmlElement('w:rFonts')
+                rpr.insert(0, rfonts)
+            rfonts.set(qn('w:ascii'), WORD_CN_FONT)
+            rfonts.set(qn('w:hAnsi'), WORD_CN_FONT)
+            rfonts.set(qn('w:eastAsia'), WORD_CN_FONT)
+
+        def add_text_paragraph(text, style=None, bold=False, color=None,
+                               align=None, space_after=4):
+            p = doc.add_paragraph(style=style)
+            if align is not None:
+                p.alignment = align
+            p.paragraph_format.space_after = Pt(space_after)
+            p.paragraph_format.line_spacing = 1.15
+            lines = str(text).splitlines() or ['']
+            for idx, line in enumerate(lines):
+                run = p.add_run(line)
+                self._set_word_font(run, 9 if style not in ('Title', 'Heading 1', 'Heading 2', 'Caption')
+                                    else {'Title':22, 'Heading 1':14,
+                                          'Heading 2':11, 'Caption':8}[style],
+                                    bold=bold or style in ('Title', 'Heading 1', 'Heading 2'),
+                                    color=color)
+                if idx < len(lines) - 1:
+                    run.add_break()
+            return p
+
+        def list_texts(flow):
+            texts = []
+            for item in getattr(flow, '_flowables', []):
+                nested = getattr(item, '_flowables', None)
+                if nested:
+                    for sub in nested:
+                        txt = self._flowable_plain_text(sub)
+                        if txt:
+                            texts.append(txt)
+                else:
+                    txt = self._flowable_plain_text(item)
+                    if txt:
+                        texts.append(txt)
+            return texts
+
+        for flow in story:
+            if isinstance(flow, Paragraph):
+                name = getattr(getattr(flow, 'style', None), 'name', '')
+                text = flow.getPlainText()
+                if name == 'cov':
+                    add_text_paragraph(text, 'Title', align=WD_ALIGN_PARAGRAPH.CENTER,
+                                       space_after=8)
+                elif name == 'sub':
+                    add_text_paragraph(text, align=WD_ALIGN_PARAGRAPH.CENTER,
+                                       color=(69, 90, 100), space_after=8)
+                elif name == 'h1':
+                    add_text_paragraph(text, 'Heading 1', space_after=4)
+                elif name == 'h2':
+                    add_text_paragraph(text, 'Heading 2', space_after=3)
+                elif name == 'cp':
+                    add_text_paragraph(text, 'Caption', color=(96, 96, 96), space_after=4)
+                elif name == 'nt':
+                    add_text_paragraph(text, color=(183, 28, 28), space_after=4)
+                elif name == 'bl':
+                    add_text_paragraph(text, bold=True, space_after=4)
+                else:
+                    add_text_paragraph(text, space_after=4)
+                continue
+
+            if isinstance(flow, Table):
+                values = getattr(flow, '_cellvalues', [])
+                if not values:
+                    continue
+                n_rows = len(values)
+                n_cols = max(len(r) for r in values)
+                table = doc.add_table(rows=n_rows, cols=n_cols)
+                table.style = 'Table Grid'
+                table.autofit = False
+                table.alignment = 1
+                tbl_pr = table._tbl.tblPr
+                layout = tbl_pr.first_child_found_in('w:tblLayout')
+                if layout is None:
+                    layout = OxmlElement('w:tblLayout')
+                    tbl_pr.append(layout)
+                layout.set(qn('w:type'), 'fixed')
+                widths = list(getattr(flow, '_colWidths', []) or [])
+                if len(widths) != n_cols:
+                    widths = [17 * cm / n_cols] * n_cols
+                for r_idx, row in enumerate(values):
+                    for c_idx in range(n_cols):
+                        cell = table.cell(r_idx, c_idx)
+                        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                        self._word_cell_margins(cell)
+                        width_in = float(widths[c_idx]) / 72.0
+                        cell.width = Inches(width_in)
+                        text = self._flowable_plain_text(row[c_idx] if c_idx < len(row) else '')
+                        p = cell.paragraphs[0]
+                        p.alignment = (WD_ALIGN_PARAGRAPH.CENTER
+                                       if r_idx == 0 or n_cols >= 5
+                                       else WD_ALIGN_PARAGRAPH.LEFT)
+                        p.paragraph_format.space_after = Pt(0)
+                        p.paragraph_format.line_spacing = 1.05
+                        lines = text.splitlines() or ['']
+                        for line_idx, line in enumerate(lines):
+                            run = p.add_run(line)
+                            self._set_word_font(run, size=7.5,
+                                                bold=(r_idx == 0),
+                                                color=(255, 255, 255) if r_idx == 0 else None)
+                            if line_idx < len(lines) - 1:
+                                run.add_break()
+                        if r_idx == 0:
+                            tc_pr = cell._tc.get_or_add_tcPr()
+                            shd = OxmlElement('w:shd')
+                            shd.set(qn('w:fill'), '1565C0')
+                            tc_pr.append(shd)
+                self._word_repeat_header(table.rows[0])
+                doc.add_paragraph().paragraph_format.space_after = Pt(2)
+                continue
+
+            if isinstance(flow, Image):
+                path = getattr(flow, 'filename', None)
+                if path and os.path.exists(path):
+                    width = min(float(getattr(flow, 'drawWidth', 15*cm)) / 72.0, 6.3)
+                    p = doc.add_paragraph()
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.paragraph_format.space_after = Pt(2)
+                    p.add_run().add_picture(path, width=Inches(width))
+                continue
+
+            if isinstance(flow, ListFlowable):
+                for text in list_texts(flow):
+                    p = doc.add_paragraph(style='List Bullet')
+                    p.paragraph_format.space_after = Pt(2)
+                    run = p.add_run(text)
+                    self._set_word_font(run, size=9)
+                continue
+
+            if isinstance(flow, PageBreak):
+                doc.add_page_break()
+                continue
+
+            if isinstance(flow, HRFlowable):
+                p = doc.add_paragraph()
+                p.paragraph_format.space_after = Pt(2)
+                p_pr = p._p.get_or_add_pPr()
+                p_bdr = OxmlElement('w:pBdr')
+                bottom = OxmlElement('w:bottom')
+                bottom.set(qn('w:val'), 'single')
+                bottom.set(qn('w:sz'), '4')
+                bottom.set(qn('w:color'), 'BBDEFB')
+                p_bdr.append(bottom)
+                p_pr.append(p_bdr)
+                continue
+
+            # Spacer 由相邻段落间距承担，避免 Word 中累积大量空白。
+
+        doc.save(fp)
+        return fp
+
+    # ── PDF / Word 共用内容模型 ───────────────────────────────────────────────
     def generate_pdf_report(self, language='zh') -> str:
+        """从与 Word 共用的 story 生成 PDF，避免两种格式内容分叉。"""
         if language == 'en':
             return self._generate_en_pdf_report()
+        subj = self.sp.get('subject_id', 'unknown')
+        story = self._zh_story()
+        fp = os.path.join(self.reports_dir, f"fMRI_Report_{subj}_zh.pdf")
+        doc = SimpleDocTemplate(fp, pagesize=A4,
+                                leftMargin=2*cm, rightMargin=2*cm,
+                                topMargin=2*cm, bottomMargin=2*cm,
+                                title='静息态fMRI脑网络分析报告',
+                                author='Brain Analyzer — Karcen Zheng')
+        doc.build(story)
+        return fp
+
+    def _zh_story(self) -> list:
+        """构建中文版完整报告内容；PDF 与 Word 均消费这一份 story。"""
         sp=self.sp; qc=self.qc; gm=self.gm; ns=self.ns; dfc=self.dfc
         roi_names=self.roi_names; FC=self.FC; n_roi=len(roi_names)
         subj=sp.get('subject_id','unknown')
@@ -460,7 +816,10 @@ class ReportGenerator:
                   Paragraph('图1：QC时间序列。上FD代理；中DVARS；下tSNR分布。', S_CAP),
                   PageBreak()]
 
-        return self._build(story, subj, language)
+        self._pdf_body(story, self.sp, self.qc, self.gm, self.ns, self.dfc,
+                       self.roi_names, self.FC, len(self.roi_names))
+        self._add_multimodal_chapter(story, language='zh')
+        return story
 
     def _pdf_body(self, story, sp, qc, gm, ns, dfc, roi_names, FC, n_roi):
         """完整报告正文 第四章至附录 — 与参考报告 05_pdf_report.py 内容一致"""
@@ -636,13 +995,21 @@ class ReportGenerator:
             f"以Pearson r>{gm.get('threshold_r',0.2)}为阈值构建二值/加权脑功能图，"
             f"节点={gm.get('n_nodes',n_roi)}，边={gm.get('n_edges',0)}，"
             f"密度={gm.get('density',0):.3f}。", S_BODY))
+        story.append(Paragraph(
+            "参考区间说明：下表为本项目当前分析流程的预设探索性区间，其中全局效率（GE）"
+            "按0.50–0.80判为区间内、<0.50判为偏低、>0.80判为偏高。"
+            "GE受ROI数量、相关阈值和网络密度显著影响，因此该区间仅用于当前"
+            f"{gm.get('n_nodes',n_roi)} ROI、Pearson r>{gm.get('threshold_r',0.2)}二值图的内部一致性判读，"
+            "不是可跨图谱、跨阈值或跨软件直接套用的健康成人临床常模；严谨判断应使用同流程、"
+            "年龄和性别匹配的健康对照队列建立百分位或z分数。",
+            S_NOTE))
         story.append(Spacer(1, 0.2*cm))
         _md = gm.get('mean_degree',0); _cc = gm.get('avg_clustering',0)
         _gge = gm.get('global_efficiency',0); _le = gm.get('local_efficiency',0)
         _cpl = gm.get('char_path_length',0); _sig = gm.get('small_world_sigma',0)
         _mod = gm.get('modularity',0)
         story.append(_tbl([
-            ["图论全局指标","本受试者数值","文献参考范围（健康成人）","解释"],
+            ["图论全局指标","本受试者数值","项目预设参考区间（健康成人）","解释"],
             ["平均连接度（Degree）",   f"{_md:.2f}",  _GRAPH_REF['mean_degree'][2],       _graph_interp('mean_degree', _md)],
             ["平均聚类系数（CC）",     f"{_cc:.3f}",  _GRAPH_REF['avg_clustering'][2],    _graph_interp('avg_clustering', _cc)],
             ["全局效率",              f"{_gge:.3f}", _GRAPH_REF['global_efficiency'][2], _graph_interp('global_efficiency', _gge)],
@@ -728,6 +1095,13 @@ class ReportGenerator:
             "不可作为医学诊断依据。本报告不作任何疾病诊断、确诊或高度怀疑的结论。"
             "所有对照仅基于群体统计特征，个体脑网络变异极大，不可从单受试者推断诊断。",
             S_NOTE))
+        story.append(Paragraph(
+            "阈值口径：疾病文献中的“全局效率降低”通常是患者组相对健康对照组的统计差异，"
+            "不是通用的个体绝对阈值。本表为保持报告内部一致，采用第八章同一项目参考区间："
+            "GE<0.50记为偏低，0.50–0.80记为区间内，GE>0.80记为偏高。"
+            "DAN FC、Hub状态等其余界值也是项目预设探索性规则，并非文献建立的个体诊断阈值。"
+            "本表只显示逐项规则命中情况，不生成疾病相似度等级。",
+            S_NOTE))
         story.append(Spacer(1, 0.3*cm))
 
         # 关键指标
@@ -748,7 +1122,7 @@ class ReportGenerator:
         flex_v_   = dfc.get("n_transitions", 0)
         dmn_fc_v_ = dmn_str  # defined in chapter 5 above — same Python scope
 
-        # ── 数据驱动相似度引擎：所有相似度/命中特征均由本受试者真实指标算出 ──────
+        # ── 数据驱动规则引擎：只报告逐项命中，不生成疾病相似度等级 ────────────
         _sim = self.disease_similarity()
         _hubset = set(gm.get('hub_regions', []))
         def _hub_state(name, zh_true, zh_false):
@@ -762,7 +1136,7 @@ class ReportGenerator:
             "MDD":  "① DMN过度连接\n② SN-DMN耦合异常\n③ 皮层-边缘连接增强\n④ 脑状态灵活性↓\n（Zhu et al. 2021, NeuroImage）",
             "BD":   "① ECN功能改变（相位依赖）\n② 杏仁核-PFC连接异常\n③ DMN改变\n（Phillips et al. 2023, Biol Psychiatry）",
             "SCZ":  "① DMN连接减弱（PCC-mPFC）\n② SMN-DMN解耦\n③ 小世界性改变（σ↓）\n（van den Heuvel 2022, Neuron）",
-            "ADHD": "① DMN抑制不足\n② DAN-DMN抗相关减弱\n③ 执行网络弱化\n④ 全局效率↓\n（Cortese et al. 2021, JCPP）",
+            "ADHD": "① DMN与认知控制网络异常\n② 网络间分离/耦合改变\n③ 研究间结果具有异质性\n④ 部分图论研究报告全局效率下降趋势\n（Cortese et al. 2021, JAACAP；Wang et al. 2009, Hum Brain Mapp）",
             "ASD":  "① 局部连接↑远程连接↓\n② 社会脑网络异常\n③ 过度局部化（σ↑）\n（Hull et al. 2017, Brain）",
             "GAD":  "① 杏仁核高连接性\n② 前额叶-杏仁核调控减弱\n③ SN过度激活\n（Etkin & Wager 2007, Am J Psychiatry）",
             "OCD":  "① 皮层-纹状体-丘脑回路增强\n② 尾状核异常\n（Rotge et al. 2010, Biol Psychiatry）",
@@ -771,7 +1145,8 @@ class ReportGenerator:
             "PD":   "① 感觉运动网络改变\n② 基底节-皮层失调\n③ 额叶-纹状体连接↓\n（Luo et al. 2021, NeuroImage）",
         }
         _dz_order = ["MDD","BD","SCZ","ADHD","ASD","GAD","OCD","PTSD","AD","PD"]
-        lit_data = [["疾病","文献典型脑网络改变","本受试者特征（真实命中）","相似度","备注（可追溯）"]]
+        lit_data = [["疾病","文献典型脑网络改变","本受试者特征（真实命中）",
+                     "规则命中（非诊断）","备注（可追溯）"]]
         for _k in _dz_order:
             _s_ = _sim[_k]
             lit_data.append([
@@ -798,16 +1173,13 @@ class ReportGenerator:
         # ── 综合小结：完全由真实数据动态生成 ─────────────────────────────────────
         _hubs_all = gm.get('hub_regions', [])
         _hub_txt = "、".join(_hubs_all) if _hubs_all else "未检出明确Hub"
-        _notable = [k for k in _dz_order if _sim[k]['level_zh'] == '中度']
-        _notable_txt = ("；相似度达『中度』的疾病模式：" +
-                        "、".join(f"{_sim[k]['zh_name']}({_sim[k]['note_zh']})" for k in _notable)
-                        ) if _notable else "；所有疾病模式相似度均为低或极低"
         _flex_txt = ("偏低" if (dfc.get('n_windows',0) > 0 and flex_v_ < 3) else "在参考范围内")
         story += [Spacer(1, 0.3*cm),
                   Paragraph(
                       f"综合文献对照小结（基于本受试者真实指标）：功能连接Hub脑区为 {_hub_txt}；"
-                      f"动态功能连接灵活性{_flex_txt}（{flex_v_}次状态转换）{_notable_txt}。"
-                      "以上相似度均由客观指标按预设规则计算，仅供科研探索；"
+                      f"动态功能连接灵活性{_flex_txt}（{flex_v_}次状态转换）。"
+                      "疾病文献对照仅逐项显示项目预设探索性规则的命中数，不生成“低/中度/高度”等"
+                      "疾病相似度等级；"
                       "个体脑网络变异极大，单受试者不可推断诊断，需经群体对照、重测信度与临床信息验证。",
                       S_BODY),
                   PageBreak()]
@@ -819,8 +1191,8 @@ class ReportGenerator:
         _sig11 = gm.get('small_world_sigma',0); _ge11 = gm.get('global_efficiency',0)
         _le11 = gm.get('local_efficiency',0)
         _sw_txt = ("呈现小世界拓扑结构" if _sig11 > 1 else "未达典型小世界阈值（σ≤1）")
-        _ge_txt = ("在健康成人参考范围内" if 0.5 <= _ge11 <= 0.8 else ("偏高" if _ge11 > 0.8 else "偏低"))
-        _le_txt = ("在参考范围内" if 0.8 <= _le11 <= 0.95 else ("偏高" if _le11 > 0.95 else "偏低"))
+        _ge_txt = _graph_interp('global_efficiency', _ge11)
+        _le_txt = _graph_interp('local_efficiency', _le11)
         _prec_txt = _fc_strength(pcc_prec_)
         story.append(Paragraph(
             f"本受试者脑功能网络σ={_sig11:.2f}，{_sw_txt}"
@@ -948,8 +1320,15 @@ class ReportGenerator:
 
     # ── Word ─────────────────────────────────────────────────────────────────
     def generate_word_report(self, language='zh') -> str:
-        if language == 'en':
-            return self._generate_en_word_report()
+        """从 PDF 同源 story 生成 Word，确保章节、表格和文字逐项一致。"""
+        language = 'en' if language == 'en' else 'zh'
+        subj = self.sp.get('subject_id', 'unknown')
+        story = self._en_story() if language == 'en' else self._zh_story()
+        fp = os.path.join(self.reports_dir, f"fMRI_Report_{subj}_{language}.docx")
+        return self._write_story_docx(story, fp, language=language)
+
+        # 以下为 v2.0 旧版独立 Word 拼装逻辑，保留在本次迁移中仅供历史对照。
+        # 运行路径已由上面的同源 story 转换取代，避免两套正文再次发生漂移。
         sp=self.sp; qc=self.qc; gm=self.gm; ns=self.ns; dfc=self.dfc
         roi_names=self.roi_names; FC=self.FC; n_roi=len(roi_names)
         subj = sp.get('subject_id','unknown')
@@ -1076,7 +1455,7 @@ class ReportGenerator:
             _s = _sim.get(_key)
             if _s:
                 pv = doc.add_paragraph()
-                pv.add_run(f"    → 本受试者相似度：{_s['level_zh']}（{_s['note_zh']}）").bold = True
+                pv.add_run(f"    → 本受试者探索性规则：{_s['level_zh']}（非诊断）").bold = True
                 # 逐项列出真实命中情况，可追溯
                 for zh, en, hit in _s['features']:
                     doc.add_paragraph(('      ✓ ' if hit else '      ✗ ') + zh)
@@ -1088,14 +1467,12 @@ class ReportGenerator:
                         doc.add_paragraph('    · 最新文献：' + LiteratureUpdater.format_ref(_r))
                 except Exception:
                     pass
-        # 综合小结：由真实 Hub + 相似度动态生成
+        # 综合小结：由真实 Hub + 逐项规则命中动态生成
         _hubs_w = gm.get('hub_regions', [])
-        _notable_w = [f"{_sim[k]['zh_name']}" for k in ["MDD","BD","SCZ","ADHD","ASD","GAD","OCD","PTSD","AD","PD"]
-                      if _sim[k]['level_zh'] == '中度']
-        _nt_txt = ("相似度达『中度』的模式：" + "、".join(_notable_w)) if _notable_w else "各疾病模式相似度均为低或极低"
         doc.add_paragraph(f'综合小结（基于本受试者真实指标）：Hub脑区为 '
-                          f'{"、".join(_hubs_w) if _hubs_w else "未检出明确Hub"}；{_nt_txt}。'
-                          '以上相似度均按客观指标预设规则计算，需经群体对照、重测信度与临床信息验证，'
+                          f'{"、".join(_hubs_w) if _hubs_w else "未检出明确Hub"}。'
+                          '疾病文献对照只报告项目预设探索性规则命中数，不生成疾病相似度等级；'
+                          '需经群体对照、重测信度与临床信息验证，'
                           '单受试者不可推断诊断。')
         doc.add_paragraph()
 
@@ -1113,6 +1490,20 @@ class ReportGenerator:
     # ENGLISH PDF REPORT
     # ═════════════════════════════════════════════════════════════════════════
     def _generate_en_pdf_report(self) -> str:
+        """从与英文 Word 共用的 story 生成 PDF。"""
+        subj = self.sp.get('subject_id', 'unknown')
+        story = self._en_story()
+        fp = os.path.join(self.reports_dir, f"fMRI_Report_{subj}_en.pdf")
+        doc = SimpleDocTemplate(fp, pagesize=A4,
+                                leftMargin=2*cm, rightMargin=2*cm,
+                                topMargin=2*cm, bottomMargin=2*cm,
+                                title='Resting-State fMRI Brain Network Analysis Report',
+                                author='Brain Analyzer — Karcen Zheng')
+        doc.build(story)
+        return fp
+
+    def _en_story(self) -> list:
+        """Build the complete English report once for both PDF and Word."""
         sp=self.sp; qc=self.qc; gm=self.gm; ns=self.ns; dfc=self.dfc
         roi_names=self.roi_names; FC=self.FC; n_roi=len(roi_names)
         subj = sp.get('subject_id', 'unknown')
@@ -1240,7 +1631,10 @@ class ReportGenerator:
                   Paragraph('Figure 3: DMN internal FC matrix (7 core nodes).', S_CAP),
                   PageBreak()]
 
-        return self._build_en(story, subj)
+        self._en_pdf_body(story, self.sp, self.qc, self.gm, self.ns, self.dfc,
+                          self.roi_names, self.FC, len(self.roi_names))
+        self._add_multimodal_chapter(story, language='en')
+        return story
 
     def _en_pdf_body(self, story, sp, qc, gm, ns, dfc, roi_names, FC, n_roi):
         """English chapters 6-11 + appendix, appended to story in-place."""
@@ -1309,19 +1703,29 @@ class ReportGenerator:
                       f"Nodes={gm.get('n_nodes',n_roi)}  "
                       f"Edges={gm.get('n_edges',0)}  "
                       f"Density={gm.get('density',0):.3f}", S_BODY)]
+        story.append(Paragraph(
+            "Reference-range note: this pipeline classifies global efficiency (GE) "
+            "as below range at <0.50, within range at 0.50–0.80, and above range at >0.80. "
+            f"This exploratory interval is used only for internal interpretation of the current "
+            f"{gm.get('n_nodes',n_roi)}-ROI binary graph at Pearson "
+            f"r>{gm.get('threshold_r',0.2)}. GE depends strongly on node count, correlation "
+            "threshold, and network density, so this is not a universal healthy-adult clinical "
+            "norm. Rigorous subject-level interpretation requires a healthy control cohort "
+            "matched for pipeline, age, and sex (Rubinov & Sporns, 2010; van Wijk et al., 2010).",
+            S_NOTE))
         _md = gm.get('mean_degree',0); _cc = gm.get('avg_clustering',0)
         _gge = gm.get('global_efficiency',0); _le = gm.get('local_efficiency',0)
         _cpl = gm.get('char_path_length',0); _sig = gm.get('small_world_sigma',0)
         _mod = gm.get('modularity',0)
         story.append(_tbl([
-            ['Graph Metric',            'This Subject',   'Reference (Healthy Adults)',    'Interpretation'],
-            ['Mean degree',             f"{_md:.2f}",  '~12–20',      _graph_interp('mean_degree', _md, zh=False)],
-            ['Avg. clustering coeff.',  f"{_cc:.3f}",  '0.5–0.8',     _graph_interp('avg_clustering', _cc, zh=False)],
-            ['Global efficiency',       f"{_gge:.3f}", '0.5–0.8',     _graph_interp('global_efficiency', _gge, zh=False)],
-            ['Local efficiency',        f"{_le:.3f}",  '0.8–0.95',    _graph_interp('local_efficiency', _le, zh=False)],
-            ['Characteristic path',     f"{_cpl:.3f}", '1.5–3.0',     _graph_interp('char_path_length', _cpl, zh=False)],
+            ['Graph Metric', 'This Subject', 'Preset Project Range (Healthy Adults)', 'Interpretation'],
+            ['Mean degree',             f"{_md:.2f}",  _GRAPH_REF['mean_degree'][3],       _graph_interp('mean_degree', _md, zh=False)],
+            ['Avg. clustering coeff.',  f"{_cc:.3f}",  _GRAPH_REF['avg_clustering'][3],    _graph_interp('avg_clustering', _cc, zh=False)],
+            ['Global efficiency',       f"{_gge:.3f}", _GRAPH_REF['global_efficiency'][3], _graph_interp('global_efficiency', _gge, zh=False)],
+            ['Local efficiency',        f"{_le:.3f}",  _GRAPH_REF['local_efficiency'][3],  _graph_interp('local_efficiency', _le, zh=False)],
+            ['Characteristic path',     f"{_cpl:.3f}", _GRAPH_REF['char_path_length'][3],  _graph_interp('char_path_length', _cpl, zh=False)],
             ['Small-world σ',           f"{_sig:.2f}", '>1 = small-world', '✓ Small-world topology' if _sig > 1 else 'Not small-world (σ≤1)'],
-            ['Modularity Q',            f"{_mod:.3f}", '0.2–0.5',     _graph_interp('modularity', _mod, zh=False)],
+            ['Modularity Q',            f"{_mod:.3f}", _GRAPH_REF['modularity'][3],        _graph_interp('modularity', _mod, zh=False)],
         ], cw=[4.5*cm, 3.5*cm, 5*cm, 5*cm]))
         story += [Spacer(1, 0.3*cm),
                   Paragraph(f"Hub regions (Degree + BC Top 25%): "
@@ -1483,6 +1887,9 @@ class ReportGenerator:
     # ENGLISH WORD REPORT
     # ═════════════════════════════════════════════════════════════════════════
     def _generate_en_word_report(self) -> str:
+        return self.generate_word_report('en')
+
+        # v2.0 legacy implementation retained below for reference only.
         sp=self.sp; qc=self.qc; gm=self.gm; ns=self.ns; dfc=self.dfc
         roi_names=self.roi_names; FC=self.FC
         subj = sp.get('subject_id', 'unknown')
@@ -1758,14 +2165,15 @@ class ReportGenerator:
             if val is None: return '—'
             return '正常✓' if lo <= val <= hi else ('偏低↓' if val < lo else '偏高↑')
 
-        # ── 相似度列改由数据驱动引擎给出（与第十章同源，可追溯）───────────────────
+        # ── 规则命中列由数据驱动引擎给出（与第十章同源，可追溯）─────────────────
         _sim = self.disease_similarity()
         def _simcol(key):
             s = _sim.get(key)
-            return f"{s['level_zh']}（{s['note_zh']}）" if s else '极低'
+            return f"{s['level_zh']}（非诊断）" if s else '无可用规则'
 
         lit_rows = [
-            ['疾病','fMRI关键指标','DTI关键指标','结构关键指标','QSM关键指标','相似度（科研参考）'],
+            ['疾病','fMRI关键指标','DTI关键指标','结构关键指标','QSM关键指标',
+             '规则命中（非诊断）'],
             ['重度抑郁症\n(MDD)',
              f"DMN={dmn_fc:.2f}，灵活性={n_trans}次，SN={sn_fc:.2f}",
              f"UF/CC FA {check(fa_g,0.35,0.55)}",
