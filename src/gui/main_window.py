@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GUI 主窗口 — Brain Analyzer v2.0
+GUI 主窗口 — Brain Analyzer V3.0
 """
 import os, sys
 from PyQt5.QtWidgets import (
@@ -18,6 +18,7 @@ from PyQt5.QtGui import QFont
 from gui.styles import StyleManager
 from gui.clinical_warning_dialog import ClinicalWarningDialog
 from core.analyzer import BrainAnalyzer
+from version import DISPLAY_VERSION
 
 
 class AnalysisWorker(QThread):
@@ -115,7 +116,7 @@ class MainWindow(QMainWindow):
     # ── UI 构建 ──────────────────────────────────────────────────────────────
 
     def _init_ui(self):
-        self.setWindowTitle("Brain Analyzer v2.0 — 脑影像自动分析软件")
+        self.setWindowTitle(f"Brain Analyzer {DISPLAY_VERSION} — 脑影像自动分析软件")
         self.setGeometry(100, 100, 1280, 820)
         self._create_menu()
 
@@ -838,15 +839,15 @@ class MainWindow(QMainWindow):
 
     def _about(self):
         QMessageBox.about(self, "关于 Brain Analyzer",
-            """<h2>Brain Analyzer v2.0</h2>
+            f"""<h2>Brain Analyzer {DISPLAY_VERSION}</h2>
 <p><b>静息态fMRI脑网络自动化分析软件</b></p>
 <p>✓ UIH 及主流 MRI 厂商 DICOM 自动识别<br>
 ✓ dcm2niix 精确解码（含 mosaic 格式）<br>
 ✓ 完整预处理：STC + 带通滤波 + 空间平滑<br>
 ✓ 功能连接、ALFF/fALFF/ReHo、图论、动态FC<br>
-✓ 中文 PDF + Word 双语报告<br>
+✓ PDF 与 Word 共用同一报告内容结构<br>
+✓ 疾病文献对照仅显示探索性规则命中，不生成疾病相似度等级<br>
 ✓ 交互式 Plotly HTML 图表</p>
 <hr>
 <p>由 <a href="https://karcen.github.io/zhengjiacheng.github.io/">Jiacheng Zheng</a>
 使用 Claude Code 辅助开发</p>""")
-

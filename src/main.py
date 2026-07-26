@@ -7,6 +7,7 @@ def main():
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtCore import Qt
     from PyQt5.QtGui import QPalette, QColor
+    from version import __version__
 
     # ── 高 DPI 必须在 QApplication 创建前设置 ──────────────────────────────
     if hasattr(Qt, 'AA_EnableHighDpiScaling'):
@@ -16,6 +17,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Brain Analyzer")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("NeuroLab")
 
     # ── 锁定浅色主题：用 Fusion + 显式白底黑字 palette，屏蔽 macOS 系统深色渗透 ──

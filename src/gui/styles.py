@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""GUI 主题样式 — Brain Analyzer v2.0"""
+"""GUI 主题样式 — Brain Analyzer V3.0"""
 from PyQt5.QtCore import Qt
 
 MONO = "Menlo, Monaco, 'Courier New', monospace"

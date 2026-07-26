@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-核心分析引擎 v2.0 — Brain Analyzer
+核心分析引擎 V3.0 — Brain Analyzer
 基于 dcm2niix + 完全离线 MNI-coord ROI 管线
 算法与验证过的 fmri_analysis/ 脚本完全一致
 """
