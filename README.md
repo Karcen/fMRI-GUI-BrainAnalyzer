@@ -24,6 +24,30 @@ fMRIPrep 队列导入请选择 derivatives 根目录或单个 `sub-*` 目录。�
 
 ---
 
+## What’s New in Brain Analyzer V3.1
+
+This release focuses on analysis reliability, safer execution, and clearer reporting.
+
+- **Accurate TR detection**: Reads repetition time from BOLD JSON metadata or a NIfTI header with explicit time units, replacing the fixed 2-second assumption.
+
+- **Improved fMRIPrep input handling**: Correctly matches session, run, and resolution identifiers to their confounds and brain masks. Supports both derivatives roots and individual subject directories.
+
+- **Explicit subject and scan selection**: Select subjects and individual BOLD scans directly in the interface. Ambiguous inputs now require a selection instead of silently using the first available scan.
+
+- **Correct confound regression**: The `24P+aCompCor` option now uses 24 motion regressors plus six aCompCor components. Missing required columns and unsupported strategies produce clear errors.
+
+- **Stronger input validation**: Checks image dimensions, TR, filtering limits, confound row counts, mask alignment, and non-finite values. Invalid ROI time series stop connectivity analysis before unusable matrices are produced.
+
+- **Consistent floating-point outputs**: Prevents cleaned NIfTI images from inheriting integer mask types, keeping saved signals consistent with their NumPy counterparts.
+
+- **Safer cancellation and separate run folders**: Analysis stops at safe checkpoints. Each GUI run receives a unique output directory, reducing accidental overwrites and mixing of old and new results.
+
+- **More reliable cohort analysis and reporting**: Preserves subject identifiers across reruns, distinguishes cancelled and pending subjects, and verifies ROI names and ordering before averaging connectivity matrices. Reports now reflect the fMRIPrep preprocessing path, actual TR, selected regression strategy, and installed package versions.
+
+**Validation:** All 38 automated tests pass, covering synthetic-data processing, GUI behavior, cancellation, and Chinese/English PDF and Word export. Cross-software numerical validation with real participant data remains pending.
+
+---
+
 ## 🆕 V3.0 更新摘要 · What’s New in V3.0
 
 - **PDF 与 Word 同源生成**：两种格式共用同一套报告内容结构，章节、指标、解释和免责声明保持一致。
