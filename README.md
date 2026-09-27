@@ -1,7 +1,7 @@
 # Brain Analyzer V3.1 · 脑影像自动分析软件
 
 > 静息态 fMRI 脑网络自动化分析工具 · Resting-state fMRI brain-network analysis toolkit
-> 由 [Jiacheng Zheng](https://karcen.github.io/zhengjiacheng.github.io/) 使用 Claude Code 辅助开发
+> 由 [Jiacheng Zheng](https://karcen.github.io/zhengjiacheng.github.io/) 使用 Claude Code 和 Codex 辅助开发
 
 ---
 
