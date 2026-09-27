@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-核心分析引擎 V3.0 — Brain Analyzer
+核心分析引擎 V3.1 — Brain Analyzer
 基于 dcm2niix + 完全离线 MNI-coord ROI 管线
 算法与验证过的 fmri_analysis/ 脚本完全一致
 """
@@ -10,11 +10,10 @@ import os, sys, json, shutil, subprocess, warnings, glob
 import numpy as np
 import nibabel as nib
 import pydicom
+from core.runtime import AnalysisCancelled
 from scipy import signal, ndimage
 from scipy.ndimage import gaussian_filter
 from scipy.stats import rankdata
-
-warnings.filterwarnings('ignore')
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  33个 MNI 坐标 ROI（完全离线，无需下载 atlas）
@@ -80,10 +79,16 @@ class BrainAnalyzer:
     """完整 fMRI 分析引擎 — 从 DICOM 到报告"""
 
     def __init__(self, dicom_path: str, output_dir: str, progress_cb=None,
-                 fmriprep_dir: str = None):
+                 fmriprep_dir: str = None, should_stop=None):
         self.dicom_root  = dicom_path
         self.output_dir  = output_dir
-        self.progress_cb = progress_cb or (lambda p, m: print(f"[{p:3d}%] {m}"))
+        self.should_stop = should_stop or (lambda: False)
+        callback = progress_cb or (lambda p, m: print(f"[{p:3d}%] {m}"))
+        def checked_progress(pct, message):
+            if self.should_stop():
+                raise AnalysisCancelled("用户取消分析")
+            callback(pct, message)
+        self.progress_cb = checked_progress
         # 当提供 fMRIPrep derivatives 目录时，跳过 DICOM 转换与内置预处理
         self.fmriprep_dir = fmriprep_dir
 
@@ -432,13 +437,18 @@ class BrainAnalyzer:
             v = affine_inv @ c
             cx, cy, cz = tuple(np.round(v[:3]).astype(int))
             r  = 1
-            x0, x1 = max(0, cx-r), min(nx_-1, cx+r+1)
-            y0, y1 = max(0, cy-r), min(ny_-1, cy+r+1)
-            z0, z1 = max(0, cz-r), min(nz_-1, cz+r+1)
+            x0, x1 = max(0, cx-r), max(0, min(nx_, cx+r+1))
+            y0, y1 = max(0, cy-r), max(0, min(ny_, cy+r+1))
+            z0, z1 = max(0, cz-r), max(0, min(nz_, cz+r+1))
             patch   = data_smooth[x0:x1, y0:y1, z0:z1, :]
             if patch.size > 0:
                 roi_ts[i] = patch.reshape(-1, nt).mean(axis=0)
 
+        invalid = [name for name, ts in zip(roi_names, roi_ts)
+                   if not np.isfinite(ts).all() or np.std(ts) < 1e-8]
+        if invalid:
+            raise ValueError("ROI 不在有效影像范围内或时间序列恒定: " + ", ".join(invalid)
+                             + "。请检查标准空间、脑覆盖范围和预处理结果。")
         FC   = np.corrcoef(roi_ts)
         FC_z = np.arctanh(np.clip(FC, -0.9999, 0.9999))
         np.fill_diagonal(FC,   0); np.fill_diagonal(FC_z, 0)
@@ -791,6 +801,8 @@ class BrainAnalyzer:
             axes[2].set_xlabel("tSNR")
             fig.suptitle(f"QC {qc_results['QC_score']}/100 {qc_results['QC_stars']}")
             plt.tight_layout(); save("qc_timeseries.png")
+        except AnalysisCancelled:
+            raise
         except Exception as e: print(f"QC图警告: {e}")
 
         # 3. Brain maps
@@ -810,6 +822,8 @@ class BrainAnalyzer:
                     axes[col].set_title(f"Z={sl}"); axes[col].axis("off")
                 fig.suptitle(mapname.replace("_map","")+" (z-score)")
                 plt.tight_layout(); save(fname)
+        except AnalysisCancelled:
+            raise
         except Exception as e: print(f"brain map图警告: {e}")
 
         # 4. 网络强度
@@ -864,6 +878,8 @@ class BrainAnalyzer:
             axes[1].scatter(range(len(dFC_st)),dFC_st,c=["#E74C3C" if s==0 else "#3498DB" for s in dFC_st],s=15)
             axes[1].set_yticks([0,1]); axes[1].set_xlabel("Window")
             plt.tight_layout(); save("dynamic_fc.png")
+        except AnalysisCancelled:
+            raise
         except Exception as e: print(f"动态FC图警告: {e}")
 
         # 8. ROI 时间序列
@@ -882,6 +898,8 @@ class BrainAnalyzer:
             axes[-1].set_xlabel("Time (s)")
             fig.suptitle("Key ROI Time Series (z-score)")
             plt.tight_layout(); save("roi_timeseries.png")
+        except AnalysisCancelled:
+            raise
         except Exception as e: print(f"ROI TS图警告: {e}")
 
         self.progress_cb(85, f"报告图像: {len(files)} 张")
@@ -921,10 +939,13 @@ class BrainAnalyzer:
                 subjects = loader.detect_subjects()
                 if not subjects:
                     raise RuntimeError(f"fMRIPrep 目录未找到受试者: {self.fmriprep_dir}")
-                subj = getattr(self, "fmriprep_subject", None) or subjects[0]
-                files = loader.find_bold(subj)
-                if not files.get("bold"):
-                    raise RuntimeError(f"未找到 {subj} 的 preproc_bold（MNI 空间）")
+                subj = getattr(self, "fmriprep_subject", None)
+                if not subj and len(subjects) != 1:
+                    raise ValueError("目录含多个受试者，请明确选择受试者。")
+                subj = subj or subjects[0]
+                files = loader.find_bold(subj, bold_path=getattr(self, "fmriprep_bold", None))
+                metadata = loader.read_metadata(files)
+                self.TR = metadata["TR"]
 
                 strategy = options.get("confound_strategy", "24P")
                 pre = loader.clean_bold(files, self.results_dir,
@@ -934,9 +955,27 @@ class BrainAnalyzer:
                     "subject_id": subj.replace("sub-", ""),
                     "preproc_backbone": "fMRIPrep (金标准)",
                     "confound_strategy": strategy,
+                    "TR": self.TR,
+                    "TR_source": metadata["TR_source"],
+                    "space": files["space"],
+                    "bold_file": os.path.basename(files["bold"]),
+                    "voxel_size": metadata["voxel_size"],
+                    "matrix": str(metadata["shape"]),
                 })
+                with open(os.path.join(self.results_dir, "scan_parameters.json"), "w", encoding="utf-8") as handle:
+                    json.dump(self.scan_params, handle, ensure_ascii=False, indent=2)
+                cfg.cfg["input"] = {"type": "fmriprep", "subject": subj, "files": files,
+                                    "TR_s": self.TR, "TR_source": metadata["TR_source"]}
+                cfg.cfg["preprocessing"].update({"n_discard_trs": 0, "slice_timing": "fmriprep",
+                    "motion_correction": "fmriprep", "normalization": "zscore_sample",
+                    "bandpass_type": "nilearn.clean_img", "bandpass_order": 5})
+                cfg.cfg["nuisance_regression"] = {"enabled": True, "strategy": strategy,
+                                                 "implementation": "nilearn.clean_img"}
+                cfg.save_yaml()
                 results.update({"nifti_file": files["bold"],
                                 "scan_params": self.scan_params,
+                                "sidecar": metadata["metadata"],
+                                "fmriprep_files": files,
                                 "fmriprep_subject": subj,
                                 "preproc_backbone": "fmriprep"})
                 results["preprocessed"] = pre
@@ -944,6 +983,8 @@ class BrainAnalyzer:
                     try:
                         fd_mm = loader.get_fd(files["confounds"])
                         results["fd_mm"] = fd_mm.tolist()
+                    except AnalysisCancelled:
+                        raise
                     except Exception as e:
                         self.progress_cb(12, f"FD 读取跳过: {e}")
             else:
@@ -971,11 +1012,13 @@ class BrainAnalyzer:
                         __import__("os").path.join(self.results_dir, "fd_mm.npy"))
                     results["motion_params"] = motion_params.tolist()
                     results["fd_mm"] = fd_mm.tolist()
+                except AnalysisCancelled:
+                    raise
                 except Exception as e:
                     self.progress_cb(35, f"运动估计跳过: {e}")
 
             # ── Nuisance Regression ─────────────────────────────────────────
-            if options.get("nuisance_regression", True):
+            if not fmriprep_mode and options.get("nuisance_regression", True):
                 try:
                     self.progress_cb(37, "Nuisance regression...")
                     import numpy as np
@@ -1000,6 +1043,8 @@ class BrainAnalyzer:
                         n_motion_params=24 if options.get("motion_24") else 6,
                     )
                     results["nuisance_cleaned"] = True
+                except AnalysisCancelled:
+                    raise
                 except Exception as e:
                     self.progress_cb(37, f"Nuisance regression 跳过: {e}")
                     results["nuisance_cleaned"] = False
@@ -1030,6 +1075,8 @@ class BrainAnalyzer:
                     results["carpet_plot"] = carpet
                     self.progress_cb(47, f"Scrubbing建议: 去除{scrub['n_scrubbed']}帧"
                                         f" → 剩余{scrub['n_remaining']}帧")
+                except AnalysisCancelled:
+                    raise
                 except Exception as e:
                     self.progress_cb(46, f"Carpet plot 跳过: {e}")
 
@@ -1051,6 +1098,8 @@ class BrainAnalyzer:
                             "matrix_file":   f"schaefer{options.get('schaefer_n',100)}_FC_pearson.npy",
                         }
                         self.progress_cb(55, f"Schaefer FC 完成 {FC_s.shape[0]}×{FC_s.shape[0]}")
+                except AnalysisCancelled:
+                    raise
                 except Exception as e:
                     self.progress_cb(50, f"Schaefer FC 跳过: {e}")
 
@@ -1083,6 +1132,8 @@ class BrainAnalyzer:
                     mma = MultimodalAnalyzer(
                         self.dicom_root, self.output_dir, progress_cb=self.progress_cb)
                     results["multimodal"] = mma.run_all_multimodal(mm_seqs)
+                except AnalysisCancelled:
+                    raise
                 except Exception as e:
                     print(f"多模态分析警告（不影响主报告）: {e}")
                     results["multimodal"] = {}
@@ -1109,10 +1160,10 @@ class BrainAnalyzer:
             self.progress_cb(99, "生成可重复性哈希...")
             try:
                 from core.advanced_preprocessing import PipelineConfig
-                cfg2 = PipelineConfig(self.output_dir)
+                cfg2 = cfg
                 snap = cfg2.snapshot(additional_info={
                     "subject_id": self.scan_params.get("subject_id","unknown"),
-                    "bold_shape":  str(results.get("sidecar",{}).get("RepetitionTime","?")),
+                    "bold_shape": list(nib.load(results["nifti_file"]).shape),
                     "n_sequences": len(self.sequences),
                 })
                 hashes = cfg2.compute_reproducibility_hash(
@@ -1123,11 +1174,15 @@ class BrainAnalyzer:
                     "results_hash":   hashes.get("results_hash",""),
                     "pipeline_snap":  snap,
                 }
+            except AnalysisCancelled:
+                raise
             except Exception as e:
                 print(f"可重复性哈希跳过: {e}")
                 results["reproducibility"] = {}
 
             self.progress_cb(100, "✓ 全部分析完成！")
+        except AnalysisCancelled:
+            raise
         except Exception as e:
             import traceback
             raise RuntimeError(f"{str(e)}\n\n{traceback.format_exc()}") from e

@@ -309,6 +309,59 @@ class ReportGenerator:
 
     def _ip(self, name): return os.path.join(self.imgs_dir, name)
 
+    @property
+    def _is_fmriprep(self):
+        return self.results.get('preproc_backbone') == 'fmriprep'
+
+    def _mask_description(self, language):
+        supplied = bool(self.results.get('fmriprep_files', {}).get('mask'))
+        if language == 'zh':
+            return 'fMRIPrep 脑掩膜' if supplied else '正值信号第40百分位估计'
+        return 'fMRIPrep brain mask' if supplied else 'Positive-signal 40th percentile estimate'
+
+    def _fmriprep_steps(self, language):
+        sp = self.sp
+        if language == 'zh':
+            return [
+                ['步骤', '方法', '状态', '说明'],
+                ['输入', sp.get('bold_file', 'N/A'), '已读取', sp.get('space', 'N/A')],
+                ['TR', f"{sp.get('TR', 'N/A')} s", '元数据', sp.get('TR_source', 'N/A')],
+                ['上游预处理', 'fMRIPrep', '外部完成', '头动/配准/切片时间细节见上游报告'],
+                ['丢弃初始帧', '本软件不额外丢弃', '0 帧', '检查上游稳态处理和 confounds'],
+                ['脑掩膜', self._mask_description(language), '已应用', '尺寸和 affine 已校验'],
+                ['混杂回归', sp.get('confound_strategy', 'N/A'), '已执行', 'nilearn.clean_img'],
+                ['去趋势及带通', 'nilearn.clean_img', '已执行', '0.01–0.1 Hz'],
+                ['标准化及平滑', 'zscore_sample / FWHM 6 mm', '已执行', '逐体素标准化后平滑'],
+            ]
+        return [
+            ['Step', 'Method', 'Status', 'Notes'],
+            ['Input', sp.get('bold_file', 'N/A'), 'Loaded', sp.get('space', 'N/A')],
+            ['TR', f"{sp.get('TR', 'N/A')} s", 'Metadata', sp.get('TR_source', 'N/A')],
+            ['Upstream preprocessing', 'fMRIPrep', 'External', 'Inspect upstream report for motion, registration and STC'],
+            ['Initial frames', 'No additional discard', '0 frames', 'Check upstream steady-state handling'],
+            ['Brain mask', self._mask_description(language), 'Applied', 'Shape and affine validated'],
+            ['Confound regression', sp.get('confound_strategy', 'N/A'), 'Applied', 'nilearn.clean_img'],
+            ['Detrend / bandpass', 'nilearn.clean_img', 'Applied', '0.01–0.1 Hz'],
+            ['Standardize / smooth', 'zscore_sample / FWHM 6 mm', 'Applied', 'Voxelwise standardization then smoothing'],
+        ]
+
+    @staticmethod
+    def _software_rows(language):
+        import sys
+        from importlib.metadata import version, PackageNotFoundError
+        rows = [['软件', '版本', '用途'] if language == 'zh' else ['Software', 'Version', 'Purpose']]
+        rows.append(['Python', sys.version.split()[0], 'Runtime'])
+        for package, purpose in [('nibabel', 'NIfTI I/O'), ('nilearn', 'Denoising'),
+                                 ('networkx', 'Graphs'), ('scikit-learn', 'Clustering'),
+                                 ('scipy', 'Signal processing'), ('reportlab', 'PDF'),
+                                 ('python-docx', 'Word')]:
+            try:
+                installed = version(package)
+            except PackageNotFoundError:
+                installed = 'N/A'
+            rows.append([package, installed, purpose])
+        return rows
+
     def _recent_refs(self, disease_key: str) -> list:
         """取某疾病的最新 PubMed 文献；未开启或离线时返回 []（调用方回退硬编码引用）。"""
         if not self.update_literature:
@@ -755,7 +808,7 @@ class ReportGenerator:
             ['扫描机构', sp.get('institution','N/A')],
             ['扫描仪',   sp.get('scanner','N/A')],
             ['扫描日期', sp.get('scan_date','N/A')],
-            ['TR / TE',  f"{sp.get('TR',2.0)} s / {sp.get('TE',30)} ms"],
+            ['TR / TE',  f"{sp.get('TR',2.0)} s / {sp.get('TE','N/A')} ms"],
             ['报告日期', datetime.now().strftime('%Y-%m-%d')],
             ['分析平台', 'Python | NetworkX | SciPy | dcm2niix | ReportLab'],
             ['QC评分',   f"{qc.get('QC_score',0)}/100  {qc.get('QC_stars','—')}"],
@@ -766,12 +819,13 @@ class ReportGenerator:
         # 一、扫描参数
         story += [Paragraph('一、扫描参数与数据概览', S_H1), _hr(),
                   Paragraph('1.1 采集参数', S_H2)]
-        stc = '✅ 已执行' if sp.get('slice_timing_available') else '⚠ 未执行'
+        stc = ('由 fMRIPrep 提供；详见上游报告' if self._is_fmriprep else
+               ('✅ 已执行' if sp.get('slice_timing_available') else '⚠ 未执行'))
         story.append(_tbl([
             ['参数','rsfMRI BOLD','T1结构像'],
             ['扫描序列','EPI BOLD','N/A'],
             ['TR', f"{sp.get('TR',2.0)} s", 'N/A'],
-            ['TE', f"{sp.get('TE',30)} ms", 'N/A'],
+            ['TE', f"{sp.get('TE','N/A')} ms", 'N/A'],
             ['体素', f"{sp.get('voxel_size','N/A')} mm", 'N/A'],
             ['时间点', f"{qc.get('n_timepoints','N/A')} ({qc.get('total_duration_min',0):.1f}min)", 'N/A'],
             ['切片时间校正', stc, 'N/A'],
@@ -783,7 +837,7 @@ class ReportGenerator:
 
         # 二、预处理
         story += [Paragraph('二、数据预处理流程', S_H1), _hr()]
-        story.append(_tbl([
+        story.append(_tbl(self._fmriprep_steps('zh') if self._is_fmriprep else [
             ['步骤','方法','状态','说明'],
             ['DICOM→NIfTI','dcm2niix','✅','UIH mosaic 自动解码'],
             ['丢弃前5TR','—','✅','steady-state'],
@@ -849,8 +903,10 @@ class ReportGenerator:
         # ══ 四、ROI & 网络 ══════════════════════════════════════════════════════
         story += [Paragraph("四、ROI定义与静息态脑网络分析", S_H1), _hr()]
         story.append(Paragraph(
-            f"本分析采用{n_roi}个基于MNI坐标的球形ROI（半径3.5mm≈1体素），涵盖8个主要静息态脑网络。"
-            "ROI坐标参考Power264图谱及AAL2图谱，在原生空间提取时间序列后计算功能连接。", S_BODY))
+            f"本分析采用{n_roi}个预设MNI坐标ROI，涵盖8个主要静息态脑网络。"
+            "每个坐标经影像仿射矩阵映射后，提取中心周围最多3×3×3体素的均值时间序列；物理范围随体素大小变化。"
+            + (f"本次使用 {sp.get('space', 'MNI')} 标准空间影像。" if self._is_fmriprep else
+               "内置流程未执行MNI配准，原生空间坐标近似定位须另行验证。"), S_BODY))
         story.append(Spacer(1, 0.2*cm))
 
         net_rows = [["网络","中文名","脑区","内部FC均值（r）","SD"]]
@@ -1237,18 +1293,18 @@ class ReportGenerator:
         story.append(Paragraph("11.3 局限性", S_H2))
         story.append(ListFlowable([
             ListItem(Paragraph("单受试者分析：不能进行群体统计推断，所有指标均为个体描述，不具备统计学意义", S_BODY), leftIndent=15),
-            ListItem(Paragraph("未进行头动矫正（需FSL/AFNI）：头动可人为增强短程连接、减弱长程连接，对FC结果有系统性偏差", S_BODY), leftIndent=15),
-            ListItem(Paragraph("未进行MNI空间配准：ROI定位采用MNI坐标近似映射到原生空间，定位精度受仿射变换限制", S_BODY), leftIndent=15),
-            ListItem(Paragraph("未进行WM/CSF噪声回归：生理噪声未完全去除，可能使FC估计偏高", S_BODY), leftIndent=15),
+            ListItem(Paragraph(("头动预处理使用上游 fMRIPrep 输出；仍需检查残余头动" if self._is_fmriprep else "内置流程仅粗略估计头动，残留头动可能影响功能连接"), S_BODY), leftIndent=15),
+            ListItem(Paragraph(("使用标准空间 BOLD；配准质量仍需检查上游 fMRIPrep 报告" if self._is_fmriprep else "未进行MNI空间配准：ROI定位采用MNI坐标近似映射到原生空间，定位精度受仿射变换限制"), S_BODY), leftIndent=15),
+            ListItem(Paragraph((f"混杂回归策略：{sp.get('confound_strategy', 'N/A')}；不能保证去除全部生理噪声" if self._is_fmriprep else "内置噪声回归属于探索性流程，需核对实际执行日志"), S_BODY), leftIndent=15),
             ListItem(Paragraph("未进行ICA-AROMA：残留头动伪迹可能影响功能连接估计", S_BODY), leftIndent=15),
             ListItem(Paragraph(f"ROI数量有限（{n_roi}个）：未覆盖全脑所有功能区，部分小脑、脑岛等区域代表性不足", S_BODY), leftIndent=15),
             ListItem(Paragraph("带通滤波去除了高频信息：可能丢失部分神经相关信号", S_BODY), leftIndent=15),
-            ListItem(Paragraph("动态FC窗口较长（88s）：可能遗漏快速脑状态切换", S_BODY), leftIndent=15),
+            ListItem(Paragraph(f"动态FC窗口时长为 {dfc.get('window_size_s', 'N/A')} s；窗口选择会影响脑状态切换结果", S_BODY), leftIndent=15),
         ], bulletType='bullet', leftIndent=10))
 
         story.append(Paragraph("11.4 建议后续研究方向", S_H2))
         story.append(ListFlowable([
-            ListItem(Paragraph("使用fMRIPrep完整预处理流程重新分析（头动矫正、ICA-AROMA、MNI配准）", S_BODY), leftIndent=15),
+            ListItem(Paragraph(("复核 fMRIPrep 上游 QC 与当前去噪配置，开展敏感性分析" if self._is_fmriprep else "使用fMRIPrep完整预处理流程重新分析"), S_BODY), leftIndent=15),
             ListItem(Paragraph("纳入同龄健康对照组（n≥20），进行网络指标的组间统计检验", S_BODY), leftIndent=15),
             ListItem(Paragraph("结合DTI弥散数据（本次已采集）进行结构-功能联合分析", S_BODY), leftIndent=15),
             ListItem(Paragraph("利用QSM/SWI数据评估铁沉积，与功能网络改变相关联", S_BODY), leftIndent=15),
@@ -1259,20 +1315,14 @@ class ReportGenerator:
 
         # ══ 十二、方法学说明 ═══════════════════════════════════════════════════
         story += [Paragraph("十二、方法学说明与可重复性", S_H1), _hr()]
-        story.append(_tbl([
-            ['dcm2niix','v1.0.20250505','DICOM→NIfTI（UIH mosaic支持）'],
-            ['Python','3.13','主语言'],['nibabel','5.4.2','NIfTI读写'],
-            ['NetworkX','3.5','图论分析'],['scikit-learn','1.7.2','K-means'],
-            ['SciPy','1.16.3','滤波/统计'],['Plotly','6.3.0','交互图表'],
-            ['ReportLab','4.5.1','PDF报告'],
-        ], cw=[4*cm,4*cm,10*cm]))
+        story.append(_tbl(self._software_rows('zh'), cw=[4*cm,4*cm,10*cm]))
         story += [Spacer(1,0.3*cm)]
         story.append(_tbl([
             ['参数','值'],
-            ['脑掩码','非零体素65th百分位+形态学开闭运算'],
-            ['带通','Butterworth 4阶 filtfilt 0.01–0.1Hz'],
+            ['脑掩码', self._mask_description('zh') if self._is_fmriprep else '非零体素65th百分位+形态学开闭运算'],
+            ['带通','nilearn.clean_img 0.01–0.1Hz' if self._is_fmriprep else 'Butterworth 4阶 filtfilt 0.01–0.1Hz'],
             ['平滑','FWHM=6mm'],['FC阈值','r>0.2'],
-            ['动态FC窗口','44TP×2s=88s 步长4TP'],
+            ['动态FC窗口', f"{dfc.get('window_size_TPs', 'N/A')} TP / {dfc.get('window_size_s', 'N/A')} s；步长 {dfc.get('step_TPs', 'N/A')} TP"],
             ['ReHo邻域','3×3×3体素'],['K-means种子','42'],
         ], cw=[6*cm,12*cm]))
         story.append(PageBreak())
@@ -1526,7 +1576,7 @@ class ReportGenerator:
             ['Institution',   sp.get('institution','N/A')],
             ['Scanner',       sp.get('scanner','N/A')],
             ['Scan Date',     sp.get('scan_date','N/A')],
-            ['TR / TE',       f"{sp.get('TR',2.0)} s / {sp.get('TE',30)} ms"],
+            ['TR / TE',       f"{sp.get('TR',2.0)} s / {sp.get('TE','N/A')} ms"],
             ['Report Date',   datetime.now().strftime('%Y-%m-%d')],
             ['Analysis Platform', 'Python | NetworkX | SciPy | dcm2niix | ReportLab'],
             ['QC Score',      f"{qc.get('QC_score',0)}/100  {qc.get('QC_stars','—')}"],
@@ -1536,14 +1586,15 @@ class ReportGenerator:
                   PageBreak()]
 
         # ── 1. Scan Parameters ───────────────────────────────────────────────
-        stc = '✅ Applied' if sp.get('slice_timing_available') else '⚠ Not applied'
+        stc = ('See upstream fMRIPrep report' if self._is_fmriprep else
+               ('✅ Applied' if sp.get('slice_timing_available') else '⚠ Not applied'))
         story += [Paragraph('1. Scan Parameters', S_H1), _hr(),
                   Paragraph('1.1 Acquisition Parameters', S_H2)]
         story.append(_tbl([
             ['Parameter',          'rsfMRI BOLD',                                   'T1 Structural'],
             ['Sequence',           'EPI BOLD',                                      'N/A'],
             ['TR',                 f"{sp.get('TR',2.0)} s",                        'N/A'],
-            ['TE',                 f"{sp.get('TE',30)} ms",                        'N/A'],
+            ['TE',                 f"{sp.get('TE','N/A')} ms",                        'N/A'],
             ['Voxel size',         f"{sp.get('voxel_size','N/A')} mm",             'N/A'],
             ['Timepoints',         f"{qc.get('n_timepoints','N/A')} ({qc.get('total_duration_min',0):.1f} min)", 'N/A'],
             ['Slice timing corr.', stc,                                             'N/A'],
@@ -1555,7 +1606,7 @@ class ReportGenerator:
 
         # ── 2. Preprocessing ─────────────────────────────────────────────────
         story += [Paragraph('2. Preprocessing Pipeline', S_H1), _hr()]
-        story.append(_tbl([
+        story.append(_tbl(self._fmriprep_steps('en') if self._is_fmriprep else [
             ['Step',                'Method',                  'Status',      'Notes'],
             ['DICOM → NIfTI',       'dcm2niix',                '✅ Done',     'UIH mosaic auto-decoded'],
             ['Discard first 5 TRs', '—',                       '✅ Done',     'Steady-state reached'],
@@ -1595,9 +1646,11 @@ class ReportGenerator:
 
         # ── 4. ROI & Networks ────────────────────────────────────────────────
         story += [Paragraph('4. ROI Definition and Resting-State Network Analysis', S_H1), _hr(),
-                  Paragraph('33 MNI-coordinate spherical ROIs (radius ≈ 3.5 mm) covering 8 major resting-state networks. '
-                             'Fully offline — no atlas download required. '
-                             'Time series extracted in native space using affine-projected MNI coordinates.', S_BODY),
+                  Paragraph('33 preset MNI-coordinate ROIs covering 8 major resting-state networks. '
+                             'Each coordinate is mapped through the image affine; signals are averaged within '
+                             'a neighborhood of up to 3×3×3 voxels. Physical extent depends on voxel size. '
+                             + (f"Input space: {sp.get('space', 'MNI')}." if self._is_fmriprep else
+                                'The built-in pipeline uses approximate native-space localisation without MNI registration.'), S_BODY),
                   Spacer(1, 0.2*cm)]
         NET_EN = {'DMN':'Default Mode','SN':'Salience','ECN':'Executive Control',
                   'SMN':'Sensorimotor','VIS':'Visual','DAN':'Dorsal Attention',
@@ -1811,31 +1864,21 @@ class ReportGenerator:
             _lim_idx = '10.3'
         story += [Paragraph(f'{_lim_idx} Limitations', S_H2),
                   _bul(['Single-subject analysis — no group-level statistical inference',
-                        'No head-motion correction, MNI registration, or WM/CSF nuisance regression',
-                        'ROI localisation in native space is approximate (affine projection)']),
+                        ('Upstream fMRIPrep preprocessing and the selected confound model require QC review' if self._is_fmriprep else 'Built-in motion and nuisance processing is exploratory; no MNI registration'),
+                        ('Inspect standard-space registration and ROI coverage' if self._is_fmriprep else 'ROI localisation in native space is approximate (affine projection)')]),
                   PageBreak()]
 
         # 11. Methods ─────────────────────────────────────────────────────────
         story += [Paragraph('11. Methods and Reproducibility', S_H1), _hr()]
-        story.append(_tbl([
-            ['Software', 'Version', 'Purpose'],
-            ['dcm2niix',    'v1.0.20250505', 'DICOM → NIfTI (UIH mosaic support)'],
-            ['Python',      '3.13',          'Primary language'],
-            ['nibabel',     '5.4.2',         'NIfTI I/O'],
-            ['NetworkX',    '3.5',           'Graph theory'],
-            ['scikit-learn','1.7.2',         'k-means brain-state clustering'],
-            ['SciPy',       '1.16.3',        'Bandpass filter, statistics'],
-            ['Plotly',      '6.3.0',         'Interactive HTML figures'],
-            ['ReportLab',   '4.5.1',         'PDF generation'],
-        ], cw=[4*cm, 4*cm, 10*cm]))
+        story.append(_tbl(self._software_rows('en'), cw=[4*cm,4*cm,10*cm]))
         story += [Spacer(1, 0.3*cm)]
         story.append(_tbl([
             ['Parameter', 'Value'],
-            ['Brain mask',       'Intensity 65th percentile + morphological open/close'],
-            ['Bandpass filter',  'Butterworth order-4 filtfilt, 0.01–0.1 Hz'],
+            ['Brain mask', self._mask_description('en') if self._is_fmriprep else 'Intensity 65th percentile + morphological open/close'],
+            ['Bandpass filter', 'nilearn.clean_img, 0.01–0.1 Hz' if self._is_fmriprep else 'Butterworth order-4 filtfilt, 0.01–0.1 Hz'],
             ['Smoothing kernel', 'FWHM = 6 mm'],
             ['FC threshold',     'Pearson r > 0.2'],
-            ['dFC window',       '44 TPs × 2 s = 88 s, step 4 TPs'],
+            ['dFC window', f"{dfc.get('window_size_TPs', 'N/A')} TPs / {dfc.get('window_size_s', 'N/A')} s; step {dfc.get('step_TPs', 'N/A')} TPs"],
             ['ReHo neighbourhood','3×3×3 voxels'],
             ['k-means seed',     '42'],
         ], cw=[6*cm, 12*cm]))
@@ -1918,7 +1961,7 @@ class ReportGenerator:
             ('Subject ID',    subj),
             ('Age / Sex',     f"{sp.get('age','N/A')} / {sp.get('sex','N/A')}"),
             ('Scanner',       sp.get('scanner', 'N/A')),
-            ('TR / TE',       f"{sp.get('TR',2.0)} s / {sp.get('TE',30)} ms"),
+            ('TR / TE',       f"{sp.get('TR',2.0)} s / {sp.get('TE','N/A')} ms"),
             ('QC Score',      f"{qc.get('QC_score',0)}/100  {qc.get('QC_stars','—')}"),
             ('Duration',      f"{qc.get('total_duration_min',8):.1f} min"),
             ('Slice timing',  '✓ Applied' if sp.get('slice_timing_available') else '⚠ Not available'),

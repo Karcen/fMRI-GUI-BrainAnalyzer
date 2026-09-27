@@ -174,11 +174,13 @@ derivatives/
 1. 打开 Brain Analyzer → **单人分析** Tab
 2. 勾选 **「使用 fMRIPrep 预处理数据（金标准）」**
 3. 点 **「选择 fMRIPrep derivatives 目录」**，选中上面的 `derivatives/` 目录
-4. 选择 confound 策略（默认 24P；追求更干净可选 36P 或 24P+aCompCor）
-5. 点 **开始分析**
+4. 选择受试者与具体扫描（session / run / 空间 / 分辨率）；多个扫描时必须明确选择
+5. 选择 confound 策略（默认 24P；按研究方案选择 36P 或 24P+aCompCor）
+6. 点 **开始分析**；实际输出目录见日志
 
 软件会自动：
-- 读取 `desc-preproc_bold`（MNI 空间）
+- 读取 `desc-preproc_bold`（MNI152NLin2009cAsym 或 MNI152NLin6Asym 空间），从 JSON 或带单位的 NIfTI 头读取实际 TR
+- 检查 confounds 行数、必需列、脑掩膜尺寸/affine 和滤波频段；发现问题时给出错误，不静默降级
 - 用 `confounds_timeseries.tsv` 做标准 confound 回归（nilearn `clean_img`）
 - 带通滤波 + 平滑 → 下游 FC / 图论 / 动态 FC 分析
 
@@ -186,13 +188,15 @@ derivatives/
 
 1. 打开 **队列分析** Tab
 2. 输入类型选 **「fMRIPrep 目录（金标准）」**
-3. **批量添加（父目录）** 选中包含多个 `derivatives` 的父目录，或逐个 **添加受试者**
+3. **批量添加** 选中包含 `sub-*` 的 derivatives 根目录，或 **添加受试者** 选择单个 `sub-*` 目录
 4. 选择队列输出目录 → **开始队列分析**
 
-软件串行处理每个受试者，完成后在 `_group/` 目录生成：
+软件串行处理每个受试者，完成后在本次 `cohort_日期时间_唯一后缀/_group/` 目录生成。若某个受试者有多个扫描，先在单人模式明确选择扫描后运行；队列会记录歧义错误，不任意选择。停止请求会保留已完成受试者的汇总，并区分 cancelled、failed 和 pending。
+
+生成文件：
 - `cohort_summary.csv`（每人一行：QC、tSNR、FD、DMN FC、σ 等）
 - `group_stats.json`（组级均值 / 标准差 / 范围）
-- `group_mean_FC.npy`（组平均 FC 矩阵，若各人 ROI 维度一致）
+- `group_mean_FC.npy`（组平均 FC 矩阵，若各人 ROI 名称、顺序和矩阵维度一致）
 
 ---
 
@@ -201,7 +205,7 @@ derivatives/
 | 策略 | 回归项 | 适用场景 |
 |------|--------|---------|
 | **24P** | 6 运动 + 导数 + 平方 | 默认，兼顾去噪与自由度 |
-| **24P+aCompCor** | 24P + 6 主成分（WM/CSF）| 生理噪声重时更干净 |
+| **24P+aCompCor** | 24P + 6 主成分（WM/CSF）| 固定选取 a_comp_cor_00–05；需检查上游分量定义与可用自由度 |
 | **36P** | 24P + WM/CSF/GS + 导数平方 | 最激进去噪；注意 GSR 争议 |
 
 > ⚠ 全局信号回归（GSR）会引入负相关伪迹，学界有争议。若审稿人反对 GSR，用 24P 或 aCompCor。
@@ -222,8 +226,18 @@ Docker Desktop 没启动。打开它，等 🐳 图标稳定后重试。
 
 **Q：软件说"目录不像 fMRIPrep derivatives"？**
 确认选的是 fMRIPrep 输出的 `derivatives` 根目录（内含 `sub-*/func/*desc-preproc_bold.nii.gz`），
-不是 BIDS 原始数据目录。
+也支持单个 `sub-*` 目录；不接受 BIDS 原始数据目录作为 fMRIPrep 输出。
 
 ---
 
 由 [Karcen Zheng](https://karcen.github.io/zhengjiacheng.github.io/) 使用 Claude Code 辅助开发 · © 2026 NeuroLab
+
+## V3.1 常见输入错误
+
+- **没有可用 MNI BOLD**：本软件的 MNI ROI 不能直接用于 T1w/原生空间；请先生成标准空间 derivatives。
+- **存在多个扫描**：在单人界面选择具体 session、run 和分辨率；队列中的歧义输入会失败并记录原因。
+- **缺少 confounds/回归列**：检查同一 run 的 TSV；24P+aCompCor 要求六个运动参数和 a_comp_cor_00–05，已有导数/平方列优先使用，缺少扩展列时从基础列计算。
+- **缺少 TR 或单位未知**：补充可靠的 RepetitionTime 元数据，不要通过猜测 TR 绕过检查。
+- **ROI 无有效信号**：检查标准空间、影像覆盖范围及上游 QC，软件会停止输出无效连接矩阵。
+
+`results/fmriprep_provenance.json` 记录实际输入、TR 来源、回归列数与清洗设置，根目录的 `pipeline_config.yaml` 和 `pipeline_snapshot_v3.1.0.json` 保存执行配置。

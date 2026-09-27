@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GUI 主窗口 — Brain Analyzer V3.0
+GUI 主窗口 — Brain Analyzer V3.1
 """
 import os, sys
 from PyQt5.QtWidgets import (
@@ -18,6 +18,7 @@ from PyQt5.QtGui import QFont
 from gui.styles import StyleManager
 from gui.clinical_warning_dialog import ClinicalWarningDialog
 from core.analyzer import BrainAnalyzer
+from core.runtime import AnalysisCancelled, create_run_directory
 from version import DISPLAY_VERSION
 
 
@@ -29,17 +30,19 @@ class AnalysisWorker(QThread):
       - fMRIPrep derivatives 目录（input_type='fmriprep'，金标准）
     """
     progress = pyqtSignal(int, str)
-    finished = pyqtSignal(dict)
+    completed = pyqtSignal(dict)
+    cancelled = pyqtSignal()
     error    = pyqtSignal(str)
 
     def __init__(self, input_path, output_dir, options,
-                 input_type="dicom", fmriprep_subject=None):
+                 input_type="dicom", fmriprep_subject=None, fmriprep_bold=None):
         super().__init__()
         self.input_path       = input_path
         self.output_dir       = output_dir
         self.options          = options
         self.input_type       = input_type
         self.fmriprep_subject = fmriprep_subject
+        self.fmriprep_bold = fmriprep_bold
 
     def run(self):
         try:
@@ -50,13 +53,19 @@ class AnalysisWorker(QThread):
             if self.input_type == "fmriprep":
                 analyzer = BrainAnalyzer(
                     dicom_path=None, output_dir=self.output_dir,
-                    progress_cb=cb, fmriprep_dir=self.input_path)
+                    progress_cb=cb, fmriprep_dir=self.input_path,
+                    should_stop=self.isInterruptionRequested)
                 analyzer.fmriprep_subject = self.fmriprep_subject
+                analyzer.fmriprep_bold = self.fmriprep_bold
             else:
                 analyzer = BrainAnalyzer(
-                    self.input_path, self.output_dir, progress_cb=cb)
+                    self.input_path, self.output_dir, progress_cb=cb,
+                    should_stop=self.isInterruptionRequested)
             results = analyzer.run_full_pipeline(self.options)
-            self.finished.emit(results)
+            results["output_dir"] = self.output_dir
+            self.completed.emit(results)
+        except AnalysisCancelled:
+            self.cancelled.emit()
         except Exception as e:
             import traceback
             self.error.emit(f"分析错误: {str(e)}\n\n{traceback.format_exc()}")
@@ -65,7 +74,7 @@ class AnalysisWorker(QThread):
 class CohortWorker(QThread):
     """队列分析工作线程 — 调用 CohortAnalyzer.run()（串行处理多受试者）"""
     progress = pyqtSignal(int, str)
-    finished = pyqtSignal(dict)
+    completed = pyqtSignal(dict)
     error    = pyqtSignal(str)
 
     def __init__(self, subjects, output_dir, options):
@@ -87,7 +96,7 @@ class CohortWorker(QThread):
                 self.subjects, self.output_dir, self.options,
                 progress_cb=cb, should_stop=lambda: self._stop)
             results = ca.run()
-            self.finished.emit(results)
+            self.completed.emit(results)
         except Exception as e:
             import traceback
             self.error.emit(f"队列分析错误: {str(e)}\n\n{traceback.format_exc()}")
@@ -102,6 +111,8 @@ class MainWindow(QMainWindow):
         self.worker       = None
         self.cohort_worker= None
         self.cohort_subjects = []   # list[Subject]
+        self._cohort_statuses = {}
+        self._close_when_idle = False
         self.dark_mode    = False
         self.sm           = StyleManager()
 
@@ -214,6 +225,17 @@ class MainWindow(QMainWindow):
         self.lbl_fmriprep.setWordWrap(True)
         self.lbl_fmriprep.setStyleSheet("color:#555; font-size:10px;")
         il.addWidget(self.lbl_fmriprep)
+        self.cmb_fp_subject = QComboBox()
+        self.cmb_fp_subject.setPlaceholderText("受试者（先选择 fMRIPrep 目录）")
+        self.cmb_fp_subject.setToolTip("选择本次分析的受试者")
+        self.cmb_fp_subject.currentIndexChanged.connect(self._refresh_fmriprep_scans)
+        il.addWidget(self.cmb_fp_subject)
+        self.cmb_fp_scan = QComboBox()
+        self.cmb_fp_scan.setPlaceholderText("扫描（session / run / 分辨率）")
+        self.cmb_fp_scan.setToolTip("选择 session / run / 空间 / 分辨率对应的 BOLD 文件")
+        il.addWidget(self.cmb_fp_scan)
+        self.cmb_fp_subject.setEnabled(False)
+        self.cmb_fp_scan.setEnabled(False)
         self.cmb_confound = QComboBox()
         self.cmb_confound.addItems([
             "24P  (24 运动参数)",
@@ -481,6 +503,8 @@ class MainWindow(QMainWindow):
         """勾选『使用 fMRIPrep 数据』时切换输入控件可用性。"""
         on = (state == Qt.Checked)
         self.btn_fmriprep.setEnabled(on)
+        self.cmb_fp_subject.setEnabled(on)
+        self.cmb_fp_scan.setEnabled(on)
         if hasattr(self, 'cmb_confound'):
             self.cmb_confound.setEnabled(on)
 
@@ -502,6 +526,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"读取 fMRIPrep 目录失败：{e}")
             return
         self.fmriprep_dir = folder
+        self.cmb_fp_subject.clear()
+        self.cmb_fp_subject.addItems(subs)
+        if len(subs) == 1:
+            self.cmb_fp_subject.setCurrentIndex(0)
         self.lbl_fmriprep.setText(
             f"fMRIPrep: {folder}\n检测到 {len(subs)} 个受试者: {', '.join(subs[:5])}"
             + ("..." if len(subs) > 5 else ""))
@@ -509,6 +537,44 @@ class MainWindow(QMainWindow):
         if not self.output_dir:
             self.output_dir = os.path.join(os.path.dirname(folder), "brain_analyzer_output")
             self.lbl_out.setText(f"输出: {self.output_dir}")
+
+    def _refresh_fmriprep_scans(self):
+        self.cmb_fp_scan.clear()
+        subject = self.cmb_fp_subject.currentText()
+        if not subject or not self.fmriprep_dir:
+            return
+        from core.fmriprep_loader import FMRIPrepLoader
+        for files in FMRIPrepLoader(self.fmriprep_dir).list_bold(subject):
+            if files["space"] in FMRIPrepLoader.MNI_SPACES:
+                self.cmb_fp_scan.addItem(os.path.basename(files["bold"]), files["bold"])
+        if self.cmb_fp_scan.count() > 1:
+            self.cmb_fp_scan.insertItem(0, "请选择扫描（session / run / 分辨率）", None)
+            self.cmb_fp_scan.setCurrentIndex(0)
+        elif self.cmb_fp_scan.count() == 1:
+            self.cmb_fp_scan.setCurrentIndex(0)
+
+    def _is_busy(self):
+        return any(w is not None and w.isRunning() for w in (self.worker, self.cohort_worker))
+
+    def _workers_finished(self):
+        if self._is_busy():
+            return
+        self.btn_start.setEnabled(True)
+        self.btn_cohort_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_cohort_stop.setEnabled(False)
+        if self._close_when_idle:
+            self.close()
+
+    def closeEvent(self, event):
+        if self._is_busy():
+            self._close_when_idle = True
+            self._stop()
+            self._cohort_stop()
+            self.status_bar.showMessage("正在安全停止分析，完成后关闭窗口…")
+            event.ignore()
+        else:
+            event.accept()
 
     def _collect_options(self) -> dict:
         """收集当前 UI 上的所有分析选项（单人 / 队列共用）。"""
@@ -540,11 +606,16 @@ class MainWindow(QMainWindow):
         }
 
     def _start(self):
+        if self._is_busy():
+            return
         use_fp = getattr(self, 'chk_use_fmriprep', None) and self.chk_use_fmriprep.isChecked()
         if use_fp:
             if not self.fmriprep_dir:
                 QMessageBox.warning(self, "警告", "请先选择 fMRIPrep derivatives 目录！"); return
             in_path, in_type = self.fmriprep_dir, "fmriprep"
+            if not self.cmb_fp_subject.currentText() or not self.cmb_fp_scan.currentData():
+                QMessageBox.warning(self, "请选择扫描", "请选择受试者和唯一的 MNI 空间 BOLD 扫描。")
+                return
         else:
             if not self.dicom_path:
                 QMessageBox.warning(self, "警告", "请先选择 DICOM 文件夹！"); return
@@ -563,22 +634,37 @@ class MainWindow(QMainWindow):
         if in_type == "fmriprep":
             self._log(f"预处理: fMRIPrep 金标准  confound 策略={options['confound_strategy']}")
 
+        try:
+            run_dir = create_run_directory(self.output_dir)
+        except OSError as exc:
+            QMessageBox.critical(self, "输出目录错误", str(exc))
+            return
+        self._log(f"本次输出目录: {run_dir}")
+        self.progress.setValue(0)
+        self.result_text.clear()
         self.btn_start.setEnabled(False)
+        self.btn_cohort_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.worker = AnalysisWorker(in_path, self.output_dir, options,
-                                     input_type=in_type)
+        self.worker = AnalysisWorker(in_path, run_dir, options, input_type=in_type,
+                                     fmriprep_subject=self.cmb_fp_subject.currentText() if use_fp else None,
+                                     fmriprep_bold=self.cmb_fp_scan.currentData() if use_fp else None)
         self.worker.progress.connect(self._update_progress)
-        self.worker.finished.connect(self._on_finished)
+        self.worker.completed.connect(self._on_finished)
+        self.worker.cancelled.connect(self._on_cancelled)
+        self.worker.finished.connect(self._workers_finished)
         self.worker.error.connect(self._on_error)
         self.worker.start()
 
     def _stop(self):
         if self.worker and self.worker.isRunning():
-            self.worker.terminate(); self.worker.wait()
-            self._log("\n[已停止] 用户取消分析")
-            self.btn_start.setEnabled(True)
+            self.worker.requestInterruption()
+            self._log("\n[停止请求] 当前计算结束后将在安全检查点停止…")
             self.btn_stop.setEnabled(False)
-            self.status_bar.showMessage("已停止")
+            self.status_bar.showMessage("正在安全停止…")
+
+    def _on_cancelled(self):
+        self._log("[已停止] 分析已取消；本次目录内的文件为未完成结果。")
+        self.status_bar.showMessage("已取消")
 
     def _update_progress(self, value, message):
         self.progress.setValue(value)
@@ -586,19 +672,18 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(message)
 
     def _on_finished(self, results):
-        self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._log("\n" + "=" * 60)
         self._log("✓ 分析完成！")
         self._log("=" * 60)
         self.result_text.setHtml(self._build_summary(results))
         self.tabs.setCurrentIndex(1)
-        QMessageBox.information(self, "完成",
-            f"分析完成！\n结果已保存至:\n{self.output_dir}")
+        if not self._close_when_idle:
+            QMessageBox.information(self, "完成",
+                f"分析完成！\n结果已保存至:\n{results.get('output_dir', self.output_dir)}")
         self.status_bar.showMessage("分析完成")
 
     def _on_error(self, msg):
-        self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._log(f"\n[错误] {msg}")
         # 只显示第一行（简洁）
@@ -612,11 +697,16 @@ class MainWindow(QMainWindow):
         return "fmriprep" if self.rb_cohort_fmriprep.isChecked() else "dicom"
 
     def _cohort_add_subject(self):
+        if self._is_busy():
+            return
         in_type = self._cohort_input_type()
         title = ("选择 fMRIPrep derivatives 目录" if in_type == "fmriprep"
                  else "选择受试者 DICOM 文件夹")
         folder = QFileDialog.getExistingDirectory(self, title)
         if not folder:
+            return
+        if in_type == "fmriprep":
+            self._cohort_import_fmriprep(folder)
             return
         sid = os.path.basename(folder.rstrip("/")) or f"sub{len(self.cohort_subjects)+1}"
         # 去重
@@ -629,9 +719,14 @@ class MainWindow(QMainWindow):
 
     def _cohort_add_many(self):
         """选择一个父目录，把其下每个子目录作为一个受试者加入。"""
+        if self._is_busy():
+            return
         in_type = self._cohort_input_type()
         parent = QFileDialog.getExistingDirectory(self, "选择包含多个受试者的父目录")
         if not parent:
+            return
+        if in_type == "fmriprep":
+            self._cohort_import_fmriprep(parent)
             return
         added = 0
         for name in sorted(os.listdir(parent)):
@@ -645,7 +740,23 @@ class MainWindow(QMainWindow):
         self._cohort_refresh_table()
         self._cohort_log(f"批量添加 {added} 个受试者（父目录: {parent}）")
 
+    def _cohort_import_fmriprep(self, folder):
+        from core.fmriprep_loader import FMRIPrepLoader
+        subjects = FMRIPrepLoader(folder).detect_subjects()
+        if not subjects:
+            QMessageBox.warning(self, "未找到受试者", "请选择包含 sub-* 的 derivatives 根目录或单个 sub-* 目录。")
+            return
+        for subject in subjects:
+            if any(s[0] == subject for s in self.cohort_subjects):
+                self._cohort_log(f"跳过重复 ID: {subject}")
+                continue
+            self.cohort_subjects.append([subject, "fmriprep", folder, subject])
+        self._cohort_refresh_table()
+        self._cohort_log(f"已读取 {len(subjects)} 个受试者；多扫描受试者需在单人模式明确选择扫描。")
+
     def _cohort_remove_selected(self):
+        if self._is_busy():
+            return
         rows = sorted({idx.row() for idx in self.cohort_table.selectedIndexes()},
                       reverse=True)
         for r in rows:
@@ -655,11 +766,11 @@ class MainWindow(QMainWindow):
 
     def _cohort_refresh_table(self):
         self.cohort_table.setRowCount(len(self.cohort_subjects))
-        for r, (sid, in_type, path, status) in enumerate(self.cohort_subjects):
+        for r, (sid, in_type, path, fp_subject) in enumerate(self.cohort_subjects):
             self.cohort_table.setItem(r, 0, QTableWidgetItem(sid))
             self.cohort_table.setItem(r, 1, QTableWidgetItem(in_type))
             self.cohort_table.setItem(r, 2, QTableWidgetItem(path))
-            self.cohort_table.setItem(r, 3, QTableWidgetItem(status or "pending"))
+            self.cohort_table.setItem(r, 3, QTableWidgetItem(self._cohort_statuses.get(sid, "pending")))
 
     def _cohort_select_output(self):
         folder = QFileDialog.getExistingDirectory(self, "选择队列输出目录")
@@ -668,6 +779,8 @@ class MainWindow(QMainWindow):
             self.lbl_cohort_out.setText(f"队列输出: {folder}")
 
     def _cohort_start(self):
+        if self._is_busy():
+            return
         if not self.cohort_subjects:
             QMessageBox.warning(self, "警告", "请先添加至少一个受试者！"); return
         if not getattr(self, "cohort_output_dir", None):
@@ -684,18 +797,29 @@ class MainWindow(QMainWindow):
         self._cohort_log(f"开始队列分析：{len(subjects)} 个受试者（串行）")
         self._cohort_log(f"输出目录: {self.cohort_output_dir}")
 
+        try:
+            run_dir = create_run_directory(self.cohort_output_dir, "cohort")
+        except OSError as exc:
+            QMessageBox.critical(self, "输出目录错误", str(exc))
+            return
+        self._cohort_statuses.clear()
+        self._cohort_refresh_table()
+        self.cohort_progress.setValue(0)
+        self.cohort_result.clear()
+        self.btn_start.setEnabled(False)
         self.btn_cohort_start.setEnabled(False)
         self.btn_cohort_stop.setEnabled(True)
-        self.cohort_worker = CohortWorker(subjects, self.cohort_output_dir, options)
+        self.cohort_worker = CohortWorker(subjects, run_dir, options)
         self.cohort_worker.progress.connect(self._cohort_progress)
-        self.cohort_worker.finished.connect(self._cohort_finished)
+        self.cohort_worker.completed.connect(self._cohort_finished)
+        self.cohort_worker.finished.connect(self._workers_finished)
         self.cohort_worker.error.connect(self._cohort_error)
         self.cohort_worker.start()
 
     def _cohort_stop(self):
         if self.cohort_worker and self.cohort_worker.isRunning():
             self.cohort_worker.stop()
-            self._cohort_log("\n[停止请求] 将在当前受试者完成后中止...")
+            self._cohort_log("\n[停止请求] 将在当前计算的安全检查点中止，保留已完成受试者汇总。")
             self.btn_cohort_stop.setEnabled(False)
 
     def _cohort_progress(self, value, message):
@@ -704,26 +828,26 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(message)
 
     def _cohort_finished(self, results):
-        self.btn_cohort_start.setEnabled(True)
         self.btn_cohort_stop.setEnabled(False)
         # 回填每个受试者状态
         rows = {s["subject_id"]: s for s in results.get("subjects", [])}
         for entry in self.cohort_subjects:
             row = rows.get(entry[0])
             if row:
-                entry[3] = row.get("status", "?")
+                self._cohort_statuses[entry[0]] = row.get("status", "?")
         self._cohort_refresh_table()
         self._cohort_log("\n" + "=" * 60)
-        self._cohort_log(f"✓ 队列完成：成功 {results.get('n_done',0)}，"
+        state = "已取消" if results.get("cancelled") else "完成"
+        self._cohort_log(f"队列{state}：成功 {results.get('n_done',0)}，"
                          f"失败 {results.get('n_failed',0)}，共 {results.get('n_total',0)}")
         self.cohort_result.setHtml(self._build_cohort_summary(results))
         self.cohort_tabs.setCurrentIndex(1)
-        QMessageBox.information(self, "队列完成",
-            f"队列分析完成！\n成功 {results.get('n_done',0)} / {results.get('n_total',0)}\n"
-            f"CSV: {results.get('csv','')}")
+        if not self._close_when_idle:
+            QMessageBox.information(self, f"队列{state}",
+                f"队列{state}！\n成功 {results.get('n_done',0)} / {results.get('n_total',0)}\n"
+                f"CSV: {results.get('csv','')}")
 
     def _cohort_error(self, msg):
-        self.btn_cohort_start.setEnabled(True)
         self.btn_cohort_stop.setEnabled(False)
         self._cohort_log(f"\n[队列错误] {msg}")
         QMessageBox.critical(self, "队列错误",
@@ -736,6 +860,8 @@ class MainWindow(QMainWindow):
         g = results.get("group", {})
         html = "<html><body style='font-family:Arial,sans-serif;font-size:13px;'>"
         html += "<h2>👥 队列组级结果</h2>"
+        if results.get("cancelled"):
+            html += "<p>任务已取消；以下仅汇总已完成的受试者。</p>"
         html += (f"<p><b>受试者:</b> 共 {results.get('n_total',0)}，"
                  f"成功 {results.get('n_done',0)}，失败 {results.get('n_failed',0)}</p>")
         n = g.get("n", 0)
@@ -823,7 +949,7 @@ class MainWindow(QMainWindow):
         for key, path in reports.items():
             html += f"<li><b>{key.upper()}:</b> {os.path.basename(path)}</li>"
         html += "</ul>"
-        html += f"<p><i>📂 全部文件保存在: {self.output_dir}</i></p>"
+        html += f"<p><i>📂 全部文件保存在: {results.get('output_dir', self.output_dir)}</i></p>"
         html += "</body></html>"
         return html
 

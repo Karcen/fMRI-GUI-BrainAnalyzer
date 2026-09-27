@@ -16,6 +16,7 @@ import csv
 import json
 import traceback
 import numpy as np
+from core.runtime import AnalysisCancelled
 
 
 class Subject:
@@ -63,6 +64,11 @@ class CohortAnalyzer:
         should_stop : fn() -> bool，返回 True 时在受试者间隔处中止
         """
         self.subjects    = subjects
+        ids = [s.subject_id for s in subjects]
+        if len(set(ids)) != len(ids):
+            raise ValueError("队列包含重复受试者 ID，请为每个受试者设置唯一 ID。")
+        if any(not sid or sid in (".", "..", "_group") or "/" in sid or "\\" in sid for sid in ids):
+            raise ValueError("受试者 ID 必须是独立目录名，且不能使用 _group。")
         self.output_dir  = output_dir
         self.options     = options
         self.progress_cb = progress_cb or (lambda p, m: print(f"[{p:3d}%] {m}"))
@@ -82,9 +88,14 @@ class CohortAnalyzer:
 
         self.progress_cb(0, f"队列分析开始：{n} 个受试者（串行处理）")
         done, failed = 0, 0
+        cancelled = False
+        for subj in self.subjects:
+            subj.status = "pending"
+            subj.results = subj.qc_score = subj.error = None
 
         for i, subj in enumerate(self.subjects):
             if self.should_stop():
+                cancelled = True
                 self.progress_cb(0, "用户中止队列分析。")
                 break
 
@@ -111,18 +122,22 @@ class CohortAnalyzer:
                     analyzer = BrainAnalyzer(
                         dicom_path=None, output_dir=subj_out,
                         progress_cb=make_cb(base_pct),
-                        fmriprep_dir=subj.input_path)
+                        fmriprep_dir=subj.input_path, should_stop=self.should_stop)
                     analyzer.fmriprep_subject = subj.fmriprep_subject
                 else:
                     analyzer = BrainAnalyzer(
                         dicom_path=subj.input_path, output_dir=subj_out,
-                        progress_cb=make_cb(base_pct))
+                        progress_cb=make_cb(base_pct), should_stop=self.should_stop)
 
                 res = analyzer.run_full_pipeline(self.options)
                 subj.results  = res
                 subj.qc_score = res.get("qc_metrics", {}).get("QC_score")
                 subj.status   = "done"
                 done += 1
+            except AnalysisCancelled:
+                subj.status = "cancelled"
+                cancelled = True
+                break
             except Exception as e:
                 subj.status = "failed"
                 subj.error  = str(e)
@@ -141,12 +156,16 @@ class CohortAnalyzer:
         self.progress_cb(99, "计算组级统计 + 导出 CSV ...")
         group = self.compute_group_stats()
         self.export_csv()
-        self.progress_cb(100,
-                         f"✓ 队列完成：成功 {done}，失败 {failed}，共 {n}")
+        state = "已取消" if cancelled else "完成"
+        self.progress_cb(int(100 * (done + failed) / n) if cancelled else 100,
+                         f"队列{state}：成功 {done}，失败 {failed}，共 {n}")
         return {
             "n_total":   n,
             "n_done":    done,
             "n_failed":  failed,
+            "cancelled": cancelled,
+            "n_cancelled": sum(s.status == "cancelled" for s in self.subjects),
+            "n_pending": sum(s.status == "pending" for s in self.subjects),
             "group":     group,
             "csv":       os.path.join(self.group_dir, "cohort_summary.csv"),
             "subjects":  [s.to_row() for s in self.subjects],
@@ -155,6 +174,11 @@ class CohortAnalyzer:
     # ── 组级统计 ──────────────────────────────────────────────────────────────
 
     def compute_group_stats(self) -> dict:
+        # Do not leave a previous run's matrices next to a new empty summary.
+        for name in ("group_mean_FC.npy", "group_std_FC.npy"):
+            path = os.path.join(self.group_dir, name)
+            if os.path.isfile(path):
+                os.remove(path)
         done = [s for s in self.subjects if s.status == "done" and s.results]
         if not done:
             g = {"n": 0, "note": "无成功受试者，跳过组级统计"}
@@ -210,14 +234,25 @@ class CohortAnalyzer:
     def _average_fc(self, done: list):
         """若所有成功受试者 FC 维度一致，计算组平均 FC 矩阵并保存。"""
         mats = []
+        reference_labels = None
         for s in done:
             fc_path = os.path.join(self.output_dir, s.subject_id,
                                    "results", "FC_pearson.npy")
             if os.path.isfile(fc_path):
                 try:
-                    mats.append(np.load(fc_path))
+                    matrix = np.load(fc_path)
+                    with open(os.path.join(os.path.dirname(fc_path), "roi_names.json"), encoding="utf-8") as handle:
+                        labels = json.load(handle)
+                    if matrix.shape != (len(labels), len(labels)) or not np.isfinite(matrix).all():
+                        return None
+                    if reference_labels is not None and reference_labels != labels:
+                        return None
+                    reference_labels = labels
+                    mats.append(matrix)
                 except Exception:
-                    pass
+                    return None
+            else:
+                return None
         if len(mats) < 2:
             return None
         shapes = {m.shape for m in mats}

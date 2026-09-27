@@ -1,7 +1,26 @@
-# Brain Analyzer V3.0 · 脑影像自动分析软件
+# Brain Analyzer V3.1 · 脑影像自动分析软件
 
 > 静息态 fMRI 脑网络自动化分析工具 · Resting-state fMRI brain-network analysis toolkit
 > 由 [Jiacheng Zheng](https://karcen.github.io/zhengjiacheng.github.io/) 使用 Claude Code 辅助开发
+
+---
+
+## V3.1 可靠性与稳定性升级（2026-09-27）
+
+- **按实际扫描读取 TR**：优先读取 BOLD JSON 的 `RepetitionTime`，否则读取带时间单位的 NIfTI 头；无法确定时明确报错。
+- **准确匹配输入**：支持 `ses-` / `run-` / `res-` 标签和单个 `sub-*` 目录，匹配对应 confounds 与 mask。单人界面可选择受试者与扫描；多个扫描时必须明确选择。
+- **回归策略与界面一致**：`24P+aCompCor` 实际使用 24 运动项加 6 个 aCompCor 分量；缺少必需列或策略未知时停止，不自动退回 6P。
+- **输入校验**：检查 BOLD 维度、TR、Nyquist 条件、非有限值、confounds 行数、mask 尺寸与 affine；MNI ROI 路径拒绝原生/T1w 空间。无效 ROI 时间序列停止 FC 计算，避免输出 NaN 矩阵。
+- **一致的浮点输出**：清洗后 NIfTI 与 NumPy 使用相同浮点信号，避免继承整数掩膜的数据类型而量化失真。
+- **安全取消与独立输出**：停止请求在计算检查点生效；关闭运行中的窗口会先请求停止。GUI 每次在所选输出根目录下新建 `analysis_日期时间_唯一后缀/` 或 `cohort_日期时间_唯一后缀/`，避免覆盖或混用历史结果。
+- **队列状态修复**：保留 fMRIPrep 受试者 ID，重跑时重置结果；区分取消、失败和未开始。组平均 FC 校验 ROI 名称及顺序，不能只看矩阵维度。
+- **报告与追溯**：中英文 PDF/Word 按 fMRIPrep 路径显示真实 TR、回归策略和预处理说明；记录运行时依赖版本。配置使用深拷贝，快照与执行配置保持一致。
+
+本次验证使用合成 NIfTI / TSV 数据，包含实际 nilearn 清洗、完整 FC/图论/动态 FC 流程、中英文 PDF/Word 导出、Qt 界面与取消操作的自动化测试。**尚未使用真实受试者数据做跨软件数值一致性验证；内置 DICOM 粗略预处理仍保留原有探索性定位。**
+
+fMRIPrep 队列导入请选择 derivatives 根目录或单个 `sub-*` 目录。多 run/session/分辨率存在歧义时，该受试者会记录明确错误；当前可在单人模式选择扫描后运行，队列不会任意选取第一个扫描。停止时保留当前任务的部分文件，它们不代表分析完成。
+
+读取约定参考 [fMRIPrep 输出文档](https://fmriprep.org/en/latest/outputs.html) 与 [nilearn clean_img API](https://nilearn.github.io/0.13.1/modules/generated/nilearn.image.clean_img.html)。
 
 ---
 
@@ -157,9 +176,8 @@ The generated **PDF and Word reports use the same content model**, covering scan
 ## 📦 安装 · Installation
 
 ```bash
-# 需要 Python 3.9+ 与以下依赖 / Requires Python 3.9+ and:
-pip install PyQt5 numpy scipy scikit-learn nibabel pydicom \
-            reportlab python-docx matplotlib networkx nilearn
+# 建议使用独立环境，Python 3.10+ / Python 3.10+
+python -m pip install -r requirements.txt
 ```
 
 - fMRIPrep 金标准路径额外需要本地 **Docker**（用于运行 fMRIPrep，非本软件依赖）。
@@ -190,7 +208,7 @@ fMRI-GUI-BrainAnalyzer/
 │   └── FMRIPREP_GUIDE.md             # fMRIPrep 完整指引 / full fMRIPrep guide
 └── src/
     ├── main.py                       # 入口 / entry point
-    ├── version.py                    # V3.0 单一版本信息源 / version source
+    ├── version.py                    # 单一版本信息源 / version source
     ├── gui/
     │   ├── main_window.py            # 主窗口（单人 + 队列）/ main window
     │   ├── clinical_warning_dialog.py# 临床警告框 / clinical warning
@@ -207,7 +225,24 @@ fMRI-GUI-BrainAnalyzer/
 
 ---
 
+## 测试 · Tests
+
+```bash
+python -m pip install -r requirements-dev.txt
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q
+```
+
+Qt 测试使用 offscreen 平台，不会打开真实分析窗口；测试不下载图谱或联网检索文献。
+
 ## 🧾 版本记录 · Changelog
+
+### V3.1 — 2026-09-27
+
+- 修复 fMRIPrep TR、文件匹配、30 列回归策略和 NIfTI 浮点保存。
+- 新增受试者/扫描选择、输入校验、安全取消、独立任务目录。
+- 修复队列状态、ROI 一致性检查、配置隔离与报告方法描述。
+- 增加依赖清单和覆盖读取、真实计算、报告导出及 GUI 的回归测试。
+
 
 ### V3.0 — 2026-07-26
 

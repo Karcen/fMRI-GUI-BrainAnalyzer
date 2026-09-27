@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Brain Analyzer V3.0 启动脚本
+Brain Analyzer V3.1 启动脚本
 自动使用含 PyQt5 + 完整科学栈的 Anaconda Python
 用法: python launcher.py
       或直接双击

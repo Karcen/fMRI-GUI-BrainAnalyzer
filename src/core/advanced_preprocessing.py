@@ -6,12 +6,13 @@
       Schaefer atlas ROI / 配置快照 / 可重复性哈希
 """
 import os, json, hashlib, warnings, glob
+from copy import deepcopy
+from version import __version__
 import numpy as np
 import nibabel as nib
 from scipy import signal, ndimage
 from scipy.ndimage import gaussian_filter
 from sklearn.decomposition import PCA
-warnings.filterwarnings("ignore")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,10 +501,10 @@ class PipelineConfig:
     """
     记录并保存完整管线配置，生成可重复性摘要。
     """
-    VERSION = "2.1.0"
+    VERSION = __version__
 
     DEFAULT_CONFIG = {
-        "version":  "2.1.0",
+        "version":  __version__,
         "preprocessing": {
             "n_discard_trs":   5,
             "slice_timing":    "linear_interpolation",
@@ -557,7 +558,7 @@ class PipelineConfig:
 
     def __init__(self, output_dir: str, overrides: dict = None):
         self.out = output_dir
-        self.cfg = dict(self.DEFAULT_CONFIG)
+        self.cfg = deepcopy(self.DEFAULT_CONFIG)
         if overrides:
             self._deep_update(self.cfg, overrides)
 
